@@ -8,7 +8,7 @@ import {
 	type ExtensionContext,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
 	EMPTY_PROJECT_STATE,
@@ -724,11 +724,11 @@ export function contextHintCard(record: GenerationRecord | undefined, frame: num
 			const contentWidth = cardWidth - 4;
 			const border = (left: string, fill: string, right: string) =>
 				theme.fg("borderMuted", left + fill.repeat(cardWidth - 2) + right);
-			const line = (text = "") => {
-				const clipped = truncateToWidth(text, contentWidth, "");
-				const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-				return `${theme.fg("borderMuted", "│")} ${clipped}${padding} ${theme.fg("borderMuted", "│")}`;
-			};
+			const line = (text = "") =>
+				wrapTextWithAnsi(text, contentWidth).map((wrapped) => {
+					const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(wrapped)));
+					return `${theme.fg("borderMuted", "│")} ${wrapped}${padding} ${theme.fg("borderMuted", "│")}`;
+				});
 			const lines = [
 				border("╭", "─", "╮"),
 				line(`${theme.fg("accent", theme.bold("CONTEXT HINT"))}  ${theme.fg("dim", "PERSISTENT · TUI ONLY")}`),
@@ -794,7 +794,7 @@ export function contextHintCard(record: GenerationRecord | undefined, frame: num
 				}
 			}
 			lines.push(border("╰", "─", "╯"));
-			return lines;
+			return lines.flat();
 		},
 	};
 }

@@ -34,9 +34,13 @@ test("one card renders loading, ready, and error states within width", () => {
 		attentionCue: { level: "none" },
 	};
 	record.sessionState = { ...EMPTY_SESSION_STATE, goal: "Ship v1", status: "done" };
-	record.projectState = { ...EMPTY_PROJECT_STATE, summary: "Context Hint" };
+	record.projectState = {
+		...EMPTY_PROJECT_STATE,
+		summary: "Context Hint keeps durable project context visible through narrow cards PROJECT_SUMMARY_END",
+	};
 	const readyLines = card.render(48);
 	expect(readyLines.join("\n")).toContain("Implemented Context Hint");
+	expect(readyLines.join("\n")).toContain("PROJECT_SUMMARY_END");
 	expect(readyLines.every((line) => visibleWidth(line) <= 48)).toBe(true);
 
 	record.status = "error";
