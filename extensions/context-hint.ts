@@ -12,6 +12,7 @@ import {
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
+	DEFAULT_CONTEXT_HINT_SETTINGS,
 	EMPTY_PROJECT_STATE,
 	EMPTY_SESSION_STATE,
 	ENTRY_TYPE,
@@ -26,6 +27,7 @@ import {
 	normalizeCodeCueEvidence,
 	projectPaths,
 	readConfig,
+	readContextHintSettings,
 	readGeneration,
 	readProjectDocument,
 	redactAndTruncate,
@@ -34,9 +36,12 @@ import {
 	updateProjectDocument,
 	validateCodeCues,
 	writeConfig,
+	writeContextHintSettings,
 	writeGeneration,
 	type CodeCue,
 	type ContextHintConfig,
+	type ContextHintMotion,
+	type ContextHintSettings,
 	type ContextHintV1,
 	type GenerationRecord,
 	type LegacyCodeCue,
@@ -51,8 +56,40 @@ import {
 const STATUS_KEY = "context-hint-redraw";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
-const DOT_FRAME_INTERVAL = 12;
+const EYE_FRAME_INTERVAL_MS = 120;
+const BLINK_MIN_DELAY_MS = 5_000;
+const BLINK_MAX_DELAY_MS = 10_000;
+const PREVIEW_STATUS_KEY = "context-hint-eye-preview";
 const MAX_TOOL_FACTS = 24;
+
+export type EyeStyle = "A" | "B" | "C";
+export type EyePhase = "open" | "half" | "closed";
+
+export const EYE_STYLES: Record<EyeStyle, Record<EyePhase, string>> = {
+	A: { open: "⊙", half: "⊖", closed: "─" },
+	B: { open: "◉", half: "◍", closed: "◡" },
+	C: { open: "[●]", half: "[•]", closed: "[─]" },
+};
+
+export function eyeGlyph(style: EyeStyle, phase: EyePhase): string {
+	return EYE_STYLES[style][phase];
+}
+
+export function nextEyeStyle(style: EyeStyle): EyeStyle {
+	return style === "A" ? "B" : style === "B" ? "C" : "A";
+}
+
+export function randomBlinkDelay(random = Math.random): number {
+	return BLINK_MIN_DELAY_MS + Math.floor(random() * (BLINK_MAX_DELAY_MS - BLINK_MIN_DELAY_MS + 1));
+}
+
+export function eyeBlinkFrames(): EyePhase[] {
+	return ["open", "half", "closed", "half", "open"];
+}
+
+export function eyeTransitionFrames(expanded: boolean): EyePhase[] {
+	return expanded ? ["closed", "half", "open"] : ["open", "half", "closed"];
+}
 
 const stringList = (maxItems = 8) =>
 	Type.Array(Type.String({ maxLength: 500 }), { maxItems });
@@ -164,6 +201,7 @@ interface ProjectIdentity {
 export default function (pi: ExtensionAPI) {
 	let project: ProjectIdentity | undefined;
 	let config: ContextHintConfig = DEFAULT_CONFIG;
+	let settings: ContextHintSettings = { ...DEFAULT_CONTEXT_HINT_SETTINGS };
 	let projectDocument: ProjectDocument | undefined;
 	let activeSessionId: string | undefined;
 	let closed = false;
@@ -173,22 +211,45 @@ export default function (pi: ExtensionAPI) {
 	const controllers = new Map<string, AbortController>();
 	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
 	let spinnerFrame = 0;
+	let eyeStyle: EyeStyle = "A";
+	let eyePhase: EyePhase = "open";
+	let eyeTimer: ReturnType<typeof setTimeout> | undefined;
+	let eyeAnimationTimer: ReturnType<typeof setInterval> | undefined;
+	let previewActive = false;
 
-	pi.registerEntryRenderer<EntryData>(ENTRY_TYPE, (entry, { expanded }, theme) => {
+	pi.registerEntryRenderer<EntryData>(ENTRY_TYPE, (entry, _options, theme) => {
 		const data = entry.data;
 		if (!data || data.kind !== "hint" || !data.generationId) return undefined;
 		const generationId = data.generationId;
 		return contextHintCard(
 			() => records.get(generationId),
 			() => spinnerFrame,
-			expanded,
+			settings.expanded,
 			theme,
+			{
+				style: previewActive ? eyeStyle : "A",
+				phase: eyePhase,
+				motion: previewActive ? "animate" : settings.motion,
+			},
 		);
 	});
 
+	pi.registerShortcut("alt+o", {
+		description: "Toggle Context Hint cards",
+		handler: async (ctx) => {
+			await toggleExpanded(ctx);
+		},
+	});
+
 	pi.on("session_start", async (event, ctx) => {
+		clearAnimationTimers();
+		previewActive = false;
+		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
 		closed = false;
 		activeSessionId = ctx.sessionManager.getSessionId();
+		settings = await readContextHintSettings(getAgentDir());
+		eyeStyle = "A";
+		eyePhase = settings.expanded ? "open" : "closed";
 		project = await resolveProjectIdentity(pi, ctx.cwd);
 		config = await readConfig(project.paths);
 		if (config.enabled) {
@@ -212,6 +273,7 @@ export default function (pi: ExtensionAPI) {
 			if (record.sessionId === activeSessionId) await writeGeneration(project.paths, interrupted);
 		}
 		syncSpinner(ctx);
+		syncEyeAnimation(ctx);
 		pulse(ctx);
 	});
 
@@ -265,11 +327,14 @@ export default function (pi: ExtensionAPI) {
 		if (!project) return;
 		await loadRecords(ctx, project.paths, records);
 		syncSpinner(ctx);
+		syncEyeAnimation(ctx);
 		pulse(ctx);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
 		closed = true;
+		clearAnimationTimers();
+		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
 		await cancelPending(`Generation interrupted by session ${event.reason}.`, ctx);
 	});
 
@@ -282,7 +347,23 @@ export default function (pi: ExtensionAPI) {
 			}
 			const action = args.trim();
 			if (!action) {
-				showStatus(ctx, config, project);
+				showStatus(ctx, config, settings, project);
+				return;
+			}
+			if (action === "toggle") {
+				await toggleExpanded(ctx);
+				return;
+			}
+			if (action === "motion reduce" || action === "motion animate") {
+				await setMotion(action.endsWith("reduce") ? "reduce" : "animate", ctx);
+				return;
+			}
+			if (action === "eye-preview start") {
+				await startEyePreview(ctx);
+				return;
+			}
+			if (action === "eye-preview stop") {
+				stopEyePreview(ctx);
 				return;
 			}
 			if (action === "enable") {
@@ -331,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				"Usage: /context-hint [enable|disable|model|regenerate|reset-session|reset-project]",
+				"Usage: /context-hint [enable|disable|model|regenerate|toggle|motion reduce|motion animate|eye-preview start|eye-preview stop|reset-session|reset-project]",
 				"warning",
 			);
 		},
@@ -357,6 +438,7 @@ export default function (pi: ExtensionAPI) {
 		await writeGeneration(project.paths, record);
 		pi.appendEntry<EntryData>(ENTRY_TYPE, { kind: "hint", generationId });
 		syncSpinner(ctx);
+		syncEyeAnimation(ctx);
 		enqueue(record, ctx);
 	}
 
@@ -414,6 +496,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			controllers.delete(record.generationId);
 			syncSpinner(ctx);
+			syncEyeAnimation(ctx);
 			if (!closed && record.sessionId === activeSessionId) pulse(ctx);
 		}
 	}
@@ -425,6 +508,7 @@ export default function (pi: ExtensionAPI) {
 		record.updatedAt = new Date().toISOString();
 		await writeGeneration(project.paths, record);
 		syncSpinner(ctx);
+		syncEyeAnimation(ctx);
 		if (!closed && record.sessionId === activeSessionId) pulse(ctx);
 	}
 
@@ -440,6 +524,7 @@ export default function (pi: ExtensionAPI) {
 			await writeGeneration(project.paths, record);
 		}
 		syncSpinner(ctx);
+		syncEyeAnimation(ctx);
 		pulse(ctx);
 	}
 
@@ -447,18 +532,179 @@ export default function (pi: ExtensionAPI) {
 		const hasPending = !closed && [...records.values()].some(
 			(record) => record.status === "pending" && record.sessionId === activeSessionId,
 		);
-		if (!hasPending) {
+		if (!hasPending || settings.motion === "reduce") {
 			if (spinnerTimer) clearInterval(spinnerTimer);
 			spinnerTimer = undefined;
+			spinnerFrame = 0;
 			return;
 		}
 		if (spinnerTimer) return;
 		spinnerFrame = 0;
 		spinnerTimer = setInterval(() => {
-			spinnerFrame = (spinnerFrame + 1) % (SPINNER.length * DOT_FRAME_INTERVAL);
+			spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
 			pulse(ctx);
 		}, SPINNER_INTERVAL_MS);
 		pulse(ctx);
+	}
+
+	function clearAnimationTimers(): void {
+		if (spinnerTimer) clearInterval(spinnerTimer);
+		if (eyeTimer) clearTimeout(eyeTimer);
+		if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+		spinnerTimer = undefined;
+		eyeTimer = undefined;
+		eyeAnimationTimer = undefined;
+	}
+
+	function hasPendingRecords(): boolean {
+		return [...records.values()].some((record) => record.status === "pending" && record.sessionId === activeSessionId);
+	}
+
+	function hasReadyRecords(): boolean {
+		return [...records.values()].some((record) => record.status === "ready");
+	}
+
+	function syncEyeAnimation(ctx: ExtensionContext): void {
+		const blocked = !hasReadyRecords() || hasPendingRecords() || closed || !settings.expanded || (!previewActive && settings.motion === "reduce");
+		if (blocked) {
+			if (eyeTimer) clearTimeout(eyeTimer);
+			if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+			eyeTimer = undefined;
+			eyeAnimationTimer = undefined;
+			eyePhase = settings.expanded ? "open" : "closed";
+			return;
+		}
+		if (!eyeTimer && !eyeAnimationTimer) scheduleEyeBlink(ctx);
+	}
+
+	function scheduleEyeBlink(ctx: ExtensionContext): void {
+		if (!settings.expanded || closed || hasPendingRecords() || (!previewActive && settings.motion === "reduce")) return;
+		if (eyeTimer) clearTimeout(eyeTimer);
+		eyeTimer = setTimeout(() => {
+			eyeTimer = undefined;
+			runBlink(ctx, () => {
+				if (previewActive) {
+					eyeStyle = nextEyeStyle(eyeStyle);
+					ctx.ui.setStatus(PREVIEW_STATUS_KEY, `Eye preview: ${eyeStyle}`);
+					pulse(ctx);
+				}
+				scheduleEyeBlink(ctx);
+			});
+		}, randomBlinkDelay());
+	}
+
+	function runBlink(ctx: ExtensionContext, done: () => void): void {
+		const frames = eyeBlinkFrames();
+		let index = 0;
+		eyePhase = frames[index];
+		pulse(ctx);
+		eyeAnimationTimer = setInterval(() => {
+			index++;
+			if (index >= frames.length) {
+				if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+				eyeAnimationTimer = undefined;
+				eyePhase = "open";
+				pulse(ctx);
+				done();
+				return;
+			}
+			eyePhase = frames[index];
+			pulse(ctx);
+		}, EYE_FRAME_INTERVAL_MS);
+	}
+
+	function transitionEye(ctx: ExtensionContext, nextExpanded: boolean): void {
+		if (eyeTimer) clearTimeout(eyeTimer);
+		if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+		eyeTimer = undefined;
+		eyeAnimationTimer = undefined;
+		if (hasPendingRecords() || (settings.motion === "reduce" && !previewActive)) {
+			eyePhase = nextExpanded ? "open" : "closed";
+			pulse(ctx);
+			return;
+		}
+		const frames = eyeTransitionFrames(nextExpanded);
+		let index = 0;
+		eyePhase = frames[index];
+		pulse(ctx);
+		eyeAnimationTimer = setInterval(() => {
+			index++;
+			if (index >= frames.length) {
+				if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+				eyeAnimationTimer = undefined;
+				eyePhase = nextExpanded ? "open" : "closed";
+				pulse(ctx);
+				if (nextExpanded) scheduleEyeBlink(ctx);
+				return;
+			}
+			eyePhase = frames[index];
+			pulse(ctx);
+		}, EYE_FRAME_INTERVAL_MS);
+	}
+
+	async function toggleExpanded(ctx: ExtensionContext): Promise<void> {
+		const nextExpanded = !settings.expanded;
+		settings = { ...settings, expanded: nextExpanded };
+		await writeContextHintSettings(getAgentDir(), settings);
+		transitionEye(ctx, nextExpanded);
+		pulse(ctx);
+	}
+
+	async function setMotion(motion: ContextHintMotion, ctx: ExtensionContext): Promise<void> {
+		settings = { ...settings, motion };
+		await writeContextHintSettings(getAgentDir(), settings);
+		if (motion === "reduce" && !previewActive) {
+			if (eyeTimer) clearTimeout(eyeTimer);
+			if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+			eyeTimer = undefined;
+			eyeAnimationTimer = undefined;
+			eyePhase = settings.expanded ? "open" : "closed";
+		} else if (settings.expanded) {
+			eyePhase = "open";
+			syncEyeAnimation(ctx);
+		}
+		syncSpinner(ctx);
+		pulse(ctx);
+	}
+
+	async function startEyePreview(ctx: ExtensionContext): Promise<void> {
+		if (previewActive) {
+			ctx.ui.notify("Eye preview already running", "warning");
+			return;
+		}
+		if (!hasReadyRecords()) {
+			ctx.ui.notify("Generate a ready Context Hint before starting eye preview", "warning");
+			return;
+		}
+		// Temporary comparison preview; remove after final eye glyph selection.
+		previewActive = true;
+		eyeStyle = "A";
+		eyePhase = settings.expanded ? "open" : "closed";
+		ctx.ui.setStatus(PREVIEW_STATUS_KEY, "Eye preview: A");
+		clearEyeTimers();
+		if (settings.expanded) scheduleEyeBlink(ctx);
+		pulse(ctx);
+	}
+
+	function stopEyePreview(ctx: ExtensionContext): void {
+		if (!previewActive) {
+			ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
+			return;
+		}
+		previewActive = false;
+		clearEyeTimers();
+		eyeStyle = "A";
+		eyePhase = settings.expanded ? "open" : "closed";
+		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
+		syncEyeAnimation(ctx);
+		pulse(ctx);
+	}
+
+	function clearEyeTimers(): void {
+		if (eyeTimer) clearTimeout(eyeTimer);
+		if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
+		eyeTimer = undefined;
+		eyeAnimationTimer = undefined;
 	}
 
 	async function rememberSessionModel(model: Model<Api>): Promise<void> {
@@ -791,9 +1037,17 @@ function isDurableProjectPath(path: string): boolean {
 		/(^|\/)docs\/adr\//.test(path);
 }
 
-function showStatus(ctx: ExtensionCommandContext, config: ContextHintConfig, project: ProjectIdentity): void {
+function showStatus(
+	ctx: ExtensionCommandContext,
+	config: ContextHintConfig,
+	settings: ContextHintSettings,
+	project: ProjectIdentity,
+): void {
 	const model = config.model.mode === "inherit" ? "inherit current" : `${config.model.provider}/${config.model.id}`;
-	ctx.ui.notify(`Context Hint ${config.enabled ? "enabled" : "disabled"}; model ${model}; state ${project.paths.dir}`, "info");
+	ctx.ui.notify(
+		`Context Hint ${config.enabled ? "enabled" : "disabled"}; model ${model}; expanded ${settings.expanded}; motion ${settings.motion}; state ${project.paths.dir}`,
+		"info",
+	);
 }
 
 async function confirmReset(ctx: ExtensionCommandContext, title: string, message: string): Promise<boolean> {
@@ -810,37 +1064,52 @@ function pulse(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, undefined);
 }
 
+export interface ContextHintCardAnimation {
+	style: EyeStyle;
+	phase: EyePhase;
+	motion: ContextHintMotion;
+}
+
 export function contextHintCard(
 	getRecord: () => GenerationRecord | undefined,
 	getFrame: () => number,
 	expanded: boolean,
 	theme: Theme,
+	animation: ContextHintCardAnimation = {
+		style: "A",
+		phase: expanded ? "open" : "closed",
+		motion: "animate",
+	},
 ): Component {
 	return {
 		invalidate() {},
 		render(width) {
 			const record = getRecord();
 			const frame = getFrame();
+			const isPending = record?.status === "pending";
+			if (isPending) {
+				const spinner = theme.fg("accent", SPINNER[animation.motion === "reduce" ? 0 : frame % SPINNER.length]);
+				const label = theme.fg("muted", "GENERATING CONTEXT HINT");
+				return [truncateToWidth(`${spinner} ${label}`, width, "")];
+			}
 			const cardWidth = Math.min(64, width);
 			if (cardWidth < 12) return [truncateToWidth("CONTEXT HINT", width, "")];
 			const contentPadding = 2;
 			const contentWidth = cardWidth - 2 - contentPadding * 2;
-			const isPending = record?.status === "pending";
 			const isError = !record || record.status === "error";
-			const isReady = !isPending && !isError;
-			const borderColor: ThemeColor = isPending ? "borderMuted" : isError ? "borderMuted" : "accent";
-			const titleColor: ThemeColor = isPending ? "dim" : isError ? "error" : "success";
-			const style = isPending
-				? { borderColor, titleColor, horizontal: "┄", vertical: "┆", topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", title: `${SPINNER[frame % SPINNER.length]} GENERATING` }
-				: isError
-					? { borderColor, titleColor, horizontal: "─", vertical: "│", topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", title: "✕ ERROR" }
-					: { borderColor, titleColor, horizontal: "━", vertical: "┃", topLeft: "┏", topRight: "┓", bottomLeft: "┗", bottomRight: "┛", title: `✓ CONTEXT HINT ${expanded ? "◉" : "◡"}` };
+			const isReady = !isError;
+			const borderColor: ThemeColor = isError ? "borderMuted" : "accent";
+			const titleColor: ThemeColor = isError ? "error" : "success";
+			const eyePhase = !expanded ? "closed" : animation.motion === "reduce" ? "open" : animation.phase;
+			const style = isError
+				? { borderColor, titleColor, horizontal: "─", vertical: "│", topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", title: "✕ ERROR" }
+				: { borderColor, titleColor, horizontal: "━", vertical: "┃", topLeft: "┏", topRight: "┓", bottomLeft: "┗", bottomRight: "┛", title: `${eyeGlyph(animation.style, eyePhase)} CONTEXT HINT` };
 			const border = (left: string, fill: string, right: string) =>
 				theme.fg(style.borderColor, left + fill.repeat(cardWidth - 2) + right);
 			const bottomBorder = (action?: "collapse" | "expand") => {
 				if (!action) return border(style.bottomLeft, style.horizontal, style.bottomRight);
 				const icon = action === "collapse" ? "▲" : "▼";
-				const fullLabel = ` ctrl+o · ${action} ${icon} `;
+				const fullLabel = ` alt+o · ${action} ${icon} `;
 				const actionLabel = ` ${action} ${icon} `;
 				const label = [fullLabel, actionLabel, ` ${icon} `].find((candidate) => visibleWidth(candidate) <= cardWidth - 2)!;
 				const fill = Math.max(0, cardWidth - 2 - visibleWidth(label));
@@ -868,9 +1137,6 @@ export function contextHintCard(
 					line(),
 					line(theme.fg("muted", "/context-hint regenerate")),
 				);
-			} else if (isPending) {
-				const dots = [".", "..", "..."][Math.floor(frame / DOT_FRAME_INTERVAL) % 3];
-				lines.push(line(theme.fg("dim", dots)));
 			} else if (expanded) {
 				const hint = record.hint!;
 				const session = record.sessionState!;

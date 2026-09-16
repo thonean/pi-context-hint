@@ -1,21 +1,25 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	DEFAULT_CONTEXT_HINT_SETTINGS,
 	EMPTY_SESSION_STATE,
 	codeCuePaths,
+	contextHintSettingsPath,
 	mergeProjectState,
 	mergeSessionState,
 	latestGenerationRecord,
 	normalizeCodeCueEvidence,
 	projectPaths,
+	readContextHintSettings,
 	readProjectDocument,
 	redactAndTruncate,
 	resetProjectDocument,
 	restoreSessionState,
 	updateProjectDocument,
 	validateCodeCues,
+	writeContextHintSettings,
 	type GenerationRecord,
 	type ProjectState,
 } from "../src/core";
@@ -90,6 +94,21 @@ describe("project persistence", () => {
 		const stale = await updateProjectDocument(paths, "git:/project/.git", "/project/a", 0, { summary: "stale" });
 		expect(stale.epoch).toBe(reset.epoch);
 		expect(stale.state.summary).toBe("");
+	});
+});
+
+describe("global display settings", () => {
+	test("uses defaults, persists updates, and repairs invalid files", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "context-hint-settings-"));
+		temporaryDirectories.push(agentDir);
+		expect(await readContextHintSettings(agentDir)).toEqual(DEFAULT_CONTEXT_HINT_SETTINGS);
+
+		const settings = { schemaVersion: 1 as const, expanded: false, motion: "reduce" as const };
+		await writeContextHintSettings(agentDir, settings);
+		expect(await readContextHintSettings(agentDir)).toEqual(settings);
+
+		await writeFile(contextHintSettingsPath(agentDir), JSON.stringify({ schemaVersion: 1, expanded: "no", motion: "animate" }));
+		expect(await readContextHintSettings(agentDir)).toEqual(DEFAULT_CONTEXT_HINT_SETTINGS);
 	});
 });
 

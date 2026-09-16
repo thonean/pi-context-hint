@@ -1,7 +1,16 @@
 import { expect, test } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { EMPTY_PROJECT_STATE, EMPTY_SESSION_STATE, type GenerationRecord } from "../src/core";
-import { contextHintCard, generateHint, shouldRestoreLastSessionModel } from "../extensions/context-hint";
+import {
+	contextHintCard,
+	eyeBlinkFrames,
+	eyeGlyph,
+	eyeTransitionFrames,
+	generateHint,
+	nextEyeStyle,
+	randomBlinkDelay,
+	shouldRestoreLastSessionModel,
+} from "../extensions/context-hint";
 
 const theme = new Proxy(
 	{
@@ -194,27 +203,65 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	).resolves.toMatchObject({ attentionCue: { level: "none" } });
 });
 
+test("eye styles keep fixed state semantics and reduced motion static", () => {
+	expect(eyeGlyph("A", "open")).toBe("⊙");
+	expect(eyeGlyph("A", "half")).toBe("⊖");
+	expect(eyeGlyph("A", "closed")).toBe("─");
+	expect(eyeGlyph("B", "open")).toBe("◉");
+	expect(eyeGlyph("C", "closed")).toBe("[─]");
+	expect(nextEyeStyle("A")).toBe("B");
+	expect(nextEyeStyle("B")).toBe("C");
+	expect(nextEyeStyle("C")).toBe("A");
+	expect(eyeTransitionFrames(true)).toEqual(["closed", "half", "open"]);
+	expect(eyeTransitionFrames(false)).toEqual(["open", "half", "closed"]);
+	expect(eyeBlinkFrames()).toEqual(["open", "half", "closed", "half", "open"]);
+	expect(randomBlinkDelay(() => 0)).toBe(5_000);
+	expect(randomBlinkDelay(() => 1 - Number.EPSILON)).toBe(10_000);
+
+	const record = pendingRecord();
+	const pending = contextHintCard(() => record, () => 9, true, theme, {
+		style: "A",
+		phase: "open",
+		motion: "reduce",
+	});
+	expect(pending.render(48)).toEqual(["⠋ GENERATING CONTEXT HINT"]);
+
+	record.status = "ready";
+	record.hint = emptyHint();
+	record.sessionState = EMPTY_SESSION_STATE;
+	record.projectState = EMPTY_PROJECT_STATE;
+	const ready = contextHintCard(() => record, () => 0, true, theme, {
+		style: "A",
+		phase: "half",
+		motion: "animate",
+	});
+	expect(ready.render(48)[0]).toContain("⊖ CONTEXT HINT");
+	const reduced = contextHintCard(() => record, () => 0, true, theme, {
+		style: "A",
+		phase: "closed",
+		motion: "reduce",
+	});
+	expect(reduced.render(48)[0]).toContain("⊙ CONTEXT HINT");
+});
+
 test("one card renders live loading, ready, and replacement error states within width", () => {
 	let record = pendingRecord();
 	let frame = 0;
 	const card = contextHintCard(() => record, () => frame, false, theme);
 	const loadingLines = card.render(48);
-	expect(loadingLines[0].startsWith("╭┄┄ ⠋ GENERATING")).toBe(true);
-	expect(loadingLines.join("\n")).toContain("┆  .");
+	expect(loadingLines).toEqual(["⠋ GENERATING CONTEXT HINT"]);
+	expect(loadingLines.join("\n")).not.toContain(".");
 	expect(loadingLines.join("\n")).not.toContain("Project · Session · Turn");
 	expect(loadingLines.join("\n")).not.toContain("collapse");
 	expect(loadingLines.join("\n")).not.toContain("expand");
-	expect(loadingLines.at(-1)).toContain("┄");
 
 	frame = 1;
 	const loadingFrameOne = card.render(48).join("\n");
-	expect(loadingFrameOne).toContain("╭┄┄ ⠙ GENERATING");
-	expect(loadingFrameOne).toContain("┆  .");
+	expect(loadingFrameOne).toBe("⠙ GENERATING CONTEXT HINT");
 
 	frame = 12;
 	const loadingFrameTwo = card.render(48).join("\n");
-	expect(loadingFrameTwo).toContain("╭┄┄ ⠹ GENERATING");
-	expect(loadingFrameTwo).toContain("┆  ..");
+	expect(loadingFrameTwo).toBe("⠹ GENERATING CONTEXT HINT");
 
 	record.status = "ready";
 	record.hint = {
@@ -251,8 +298,8 @@ test("one card renders live loading, ready, and replacement error states within 
 	};
 	const expandedCard = contextHintCard(() => record, () => frame, true, theme);
 	const readyLines = expandedCard.render(48);
-	expect(readyLines.join("\n")).toContain("✓ CONTEXT HINT ◉");
-	expect(readyLines[0].startsWith("┏━━ ✓ CONTEXT HINT")).toBe(true);
+	expect(readyLines.join("\n")).toContain("⊙ CONTEXT HINT");
+	expect(readyLines[0].startsWith("┏━━ ⊙ CONTEXT HINT")).toBe(true);
 	expect(readyLines.at(-1)).toContain("━");
 	expect(readyLines.some((line) => line.includes("┃"))).toBe(true);
 	expect(readyLines.join("\n")).toContain("Implemented Context Hint");
@@ -263,18 +310,18 @@ test("one card renders live loading, ready, and replacement error states within 
 	expect(readyLines.join("\n")).toContain("T test/extension.test.ts");
 	expect(readyLines.join("\n")).toContain("Protects narrow-card rendering");
 	expect(readyLines.every((line) => visibleWidth(line) <= 48)).toBe(true);
-	expect(readyLines.at(-1)).toContain(" ctrl+o · collapse ▲ ");
+	expect(readyLines.at(-1)).toContain(" alt+o · collapse ▲ ");
 	expect(readyLines.join("\n")).toContain("DETAIL");
 
 	const collapsedReadyLines = card.render(48);
 	expect(collapsedReadyLines).toHaveLength(2);
-	expect(collapsedReadyLines.at(-1)).toContain(" ctrl+o · expand ▼ ");
-	expect(collapsedReadyLines[0]).toContain("✓ CONTEXT HINT ◡");
+	expect(collapsedReadyLines.at(-1)).toContain(" alt+o · expand ▼ ");
+	expect(collapsedReadyLines[0]).toContain("─ CONTEXT HINT");
 	expect(collapsedReadyLines.join("\n")).not.toContain("Implemented Context Hint");
 
 	const narrowExpandedLines = expandedCard.render(12);
 	expect(narrowExpandedLines.at(-1)).toContain(" ▲ ");
-	expect(narrowExpandedLines.at(-1)).not.toContain("ctrl+o");
+	expect(narrowExpandedLines.at(-1)).not.toContain("alt+o");
 	expect(narrowExpandedLines.at(-1)).not.toContain("collapse");
 	expect(narrowExpandedLines.every((line) => visibleWidth(line) <= 12)).toBe(true);
 
@@ -295,6 +342,24 @@ test("one card renders live loading, ready, and replacement error states within 
 	expect(errorLines[0].startsWith("╭── ✕ ERROR")).toBe(true);
 	expect(errorLines.at(-1)).toContain("─");
 });
+
+function emptyHint() {
+	return {
+		turnDelta: {
+			accomplished: [],
+			learned: [],
+			ruledOut: [],
+			codeCues: [],
+			verification: [],
+			failures: [],
+			decisionsMade: [],
+			questionsForHuman: [],
+		},
+		sessionPatch: {},
+		projectPatch: null,
+		attentionCue: { level: "none" as const },
+	};
+}
 
 function pendingRecord(): GenerationRecord {
 	return {

@@ -12,6 +12,7 @@ Context Hint generates a compact card after each settled interaction. Current go
 - Keeps branch-aware Session Context across resume, fork, and clone flows
 - Summarizes each settled turn from bounded, redacted evidence
 - Shows loading, ready, and error states in one transcript card
+- Persists expanded/collapsed display state and supports reduced motion
 - Lets you choose the generation model or regenerate the latest hint
 - Starts disabled and stores no runtime state inside the repository
 
@@ -41,7 +42,7 @@ Enable the extension:
 
 Continue working normally. After the next settled interaction, Context Hint adds a card containing Project, Session, and Turn context.
 
-Use `ctrl+o` to expand or collapse a completed card.
+Use `alt+o` to expand or collapse Context Hint cards.
 
 ## Commands
 
@@ -52,6 +53,11 @@ Use `ctrl+o` to expand or collapse a completed card.
 | `/context-hint disable` | Disable generation while keeping existing state |
 | `/context-hint model` | Choose the generation model |
 | `/context-hint regenerate` | Regenerate the latest settled hint |
+| `/context-hint toggle` | Expand or collapse Context Hint cards |
+| `/context-hint motion reduce` | Disable spinner and eye animation |
+| `/context-hint motion animate` | Enable spinner and eye animation |
+| `/context-hint eye-preview start` | Preview the available eye glyph styles |
+| `/context-hint eye-preview stop` | Stop the eye glyph preview |
 | `/context-hint reset-session` | Reset rolling Session Context |
 | `/context-hint reset-project` | Reset durable Project Context for this project |
 

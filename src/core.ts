@@ -122,6 +122,14 @@ export interface ContextHintConfig {
 	lastSessionModel?: { provider: string; id: string };
 }
 
+export type ContextHintMotion = "animate" | "reduce";
+
+export interface ContextHintSettings {
+	schemaVersion: 1;
+	expanded: boolean;
+	motion: ContextHintMotion;
+}
+
 export interface ProjectDocument {
 	schemaVersion: 1;
 	identity: string;
@@ -165,6 +173,12 @@ export const DEFAULT_CONFIG: ContextHintConfig = {
 	schemaVersion: 1,
 	enabled: false,
 	model: { mode: "inherit" },
+};
+
+export const DEFAULT_CONTEXT_HINT_SETTINGS: ContextHintSettings = {
+	schemaVersion: 1,
+	expanded: true,
+	motion: "animate",
 };
 
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
@@ -291,6 +305,18 @@ export function projectPaths(agentDir: string, identity: string): ProjectPaths {
 		generations: join(dir, "generations"),
 		lock: join(dir, ".project.lock"),
 	};
+}
+
+export function contextHintSettingsPath(agentDir: string): string {
+	return join(agentDir, "context-hint", "settings.json");
+}
+
+export async function readContextHintSettings(agentDir: string): Promise<ContextHintSettings> {
+	return (await readValidatedJson(contextHintSettingsPath(agentDir), isContextHintSettings)) ?? { ...DEFAULT_CONTEXT_HINT_SETTINGS };
+}
+
+export async function writeContextHintSettings(agentDir: string, settings: ContextHintSettings): Promise<void> {
+	await atomicWriteJson(contextHintSettingsPath(agentDir), settings);
 }
 
 export function generationPath(paths: ProjectPaths, generationId: string): string {
@@ -454,6 +480,10 @@ async function withProjectLock<T>(paths: ProjectPaths, work: () => Promise<T>): 
 	} finally {
 		await rm(paths.lock, { recursive: true, force: true });
 	}
+}
+
+function isContextHintSettings(value: unknown): value is ContextHintSettings {
+	return isObject(value) && value.schemaVersion === 1 && typeof value.expanded === "boolean" && (value.motion === "animate" || value.motion === "reduce");
 }
 
 function isConfig(value: unknown): value is ContextHintConfig {
