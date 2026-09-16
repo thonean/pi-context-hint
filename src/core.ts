@@ -15,17 +15,24 @@ export type SessionStatus =
 
 export interface CodeCue {
 	path: string;
+	reason: string;
+	kind: "modified" | "created" | "deleted" | "verified" | "focal";
+}
+
+export interface LegacyCodeCue {
+	path: string;
 	lineStart?: number;
 	lineEnd?: number;
 	reason?: string;
-	kind?: "read" | "modified" | "created" | "deleted" | "focal";
+	kind?: "read" | CodeCue["kind"];
 }
 
 export interface TurnDelta {
 	accomplished: string[];
 	learned: string[];
 	ruledOut: string[];
-	filesTouched: CodeCue[];
+	codeCues: CodeCue[];
+	filesTouched?: LegacyCodeCue[];
 	verification: string[];
 	failures: string[];
 	decisionsMade: string[];
@@ -112,6 +119,7 @@ export interface ContextHintConfig {
 	schemaVersion: 1;
 	enabled: boolean;
 	model: { mode: "inherit" } | { mode: "explicit"; provider: string; id: string };
+	lastSessionModel?: { provider: string; id: string };
 }
 
 export interface ProjectDocument {
@@ -216,15 +224,18 @@ function mergeDecisions(current: ImportantDecision[], patch?: ImportantDecision[
 	return [...merged.values()];
 }
 
+export function codeCuePaths(tools: ToolFact[]): string[] {
+	return [...new Set(tools.filter((tool) => tool.ok).flatMap((tool) => tool.paths))].sort();
+}
+
+export function normalizeCodeCueEvidence(evidence: TurnEvidence): TurnEvidence {
+	return { ...evidence, knownPaths: codeCuePaths(evidence.tools) };
+}
+
 export function validateCodeCues(cues: CodeCue[], knownPaths: Set<string>): void {
 	for (const cue of cues) {
 		if (!knownPaths.has(cue.path)) throw new Error(`unsupported code cue: ${cue.path}`);
-		if (cue.lineStart !== undefined && (!Number.isInteger(cue.lineStart) || cue.lineStart < 1)) {
-			throw new Error(`unsupported code cue range: ${cue.path}`);
-		}
-		if (cue.lineEnd !== undefined && (!Number.isInteger(cue.lineEnd) || cue.lineEnd < (cue.lineStart ?? 1))) {
-			throw new Error(`unsupported code cue range: ${cue.path}`);
-		}
+		if (!cue.reason.trim()) throw new Error(`unsupported code cue reason: ${cue.path}`);
 	}
 }
 
@@ -382,9 +393,11 @@ export function cloneProjectState(state: ProjectState): ProjectState {
 }
 
 function cloneConfig(config: ContextHintConfig): ContextHintConfig {
-	return config.model.mode === "inherit"
-		? { ...config, model: { mode: "inherit" } }
-		: { ...config, model: { ...config.model } };
+	return {
+		...config,
+		model: config.model.mode === "inherit" ? { mode: "inherit" } : { ...config.model },
+		...(config.lastSessionModel ? { lastSessionModel: { ...config.lastSessionModel } } : {}),
+	};
 }
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
@@ -450,7 +463,11 @@ function isConfig(value: unknown): value is ContextHintConfig {
 		typeof value.enabled === "boolean" &&
 		isObject(value.model) &&
 		(value.model.mode === "inherit" ||
-			(value.model.mode === "explicit" && typeof value.model.provider === "string" && typeof value.model.id === "string"))
+			(value.model.mode === "explicit" && typeof value.model.provider === "string" && typeof value.model.id === "string")) &&
+		(value.lastSessionModel === undefined ||
+			(isObject(value.lastSessionModel) &&
+				typeof value.lastSessionModel.provider === "string" &&
+				typeof value.lastSessionModel.id === "string"))
 	);
 }
 

@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	EMPTY_SESSION_STATE,
+	codeCuePaths,
 	mergeProjectState,
 	mergeSessionState,
 	latestGenerationRecord,
+	normalizeCodeCueEvidence,
 	projectPaths,
 	readProjectDocument,
 	redactAndTruncate,
@@ -16,7 +18,7 @@ import {
 	validateCodeCues,
 	type GenerationRecord,
 	type ProjectState,
-} from "./.pi/context-hint/core";
+} from "../src/core";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
@@ -123,14 +125,48 @@ describe("branch restoration", () => {
 	});
 });
 
-describe("code cue validation", () => {
-	test("rejects invented paths and invalid ranges", () => {
+describe("code cues", () => {
+	test("uses only paths from successful tool calls", () => {
+		expect(
+			codeCuePaths([
+				{ name: "edit", ok: true, input: "", result: "", paths: ["src/card.ts"] },
+				{ name: "read", ok: true, input: "", result: "", paths: ["src/card.ts", "src/state.ts"] },
+				{ name: "edit", ok: false, input: "", result: "failed", paths: ["src/failed.ts"] },
+			]),
+		).toEqual(["src/card.ts", "src/state.ts"]);
+	});
+
+	test("normalizes legacy evidence to successful tool paths", () => {
+		const evidence = {
+			schemaVersion: 1 as const,
+			capturedAt: "2026-09-14T00:00:00.000Z",
+			userPrompt: "regenerate",
+			assistantText: "",
+			imageCount: 0,
+			tools: [
+				{ name: "edit", ok: true, input: "", result: "", paths: ["src/card.ts"] },
+				{ name: "edit", ok: false, input: "", result: "failed", paths: ["src/failed.ts"] },
+			],
+			knownPaths: ["CONTEXT.md", "src/card.ts", "src/failed.ts"],
+			projectFacts: [],
+		};
+
+		expect(normalizeCodeCueEvidence(evidence).knownPaths).toEqual(["src/card.ts"]);
+	});
+
+	test("rejects invented paths and blank reasons", () => {
 		expect(() =>
 			validateCodeCues(
-				[{ path: "src/invented.ts", lineStart: 8, lineEnd: 2 }],
+				[{ path: "src/invented.ts", kind: "focal", reason: "Relevant implementation" }],
 				new Set(["src/known.ts"]),
 			),
 		).toThrow("unsupported code cue");
+		expect(() =>
+			validateCodeCues(
+				[{ path: "src/known.ts", kind: "focal", reason: "   " }],
+				new Set(["src/known.ts"]),
+			),
+		).toThrow("unsupported code cue reason");
 	});
 });
 
@@ -163,7 +199,7 @@ function record(generationId: string, goal: string): GenerationRecord {
 				accomplished: [],
 				learned: [],
 				ruledOut: [],
-				filesTouched: [],
+				codeCues: [],
 				verification: [],
 				failures: [],
 				decisionsMade: [],
