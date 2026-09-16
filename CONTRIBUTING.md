@@ -51,9 +51,8 @@ After package identity is ready for publication:
 6. Settle one interaction and confirm one Context Hint card renders.
 7. Expand and collapse the card with `alt+o`, then restart Pi and confirm the display state persists.
 8. Run `/context-hint motion reduce` and confirm spinner and eye animation stop; restore them with `/context-hint motion animate`.
-9. Run `/context-hint eye-preview start`, confirm styles cycle, then stop it with `/context-hint eye-preview stop`.
-10. Run `/context-hint regenerate` and confirm the replacement card resolves.
-11. Confirm `/context-hint reset-session` and `/context-hint reset-project` still require confirmation.
+9. Run `/context-hint regenerate` and confirm the replacement card resolves.
+10. Confirm `/context-hint reset-session` and `/context-hint reset-project` still require confirmation.
 
 Do not add model credentials to CI. Real model interaction belongs in this local check.
 

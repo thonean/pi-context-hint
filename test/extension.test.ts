@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { EMPTY_PROJECT_STATE, EMPTY_SESSION_STATE, type GenerationRecord } from "../src/core";
 import {
+	contextHintArgumentCompletions,
 	contextHintCard,
 	eyeBlinkFrames,
 	eyeGlyph,
 	eyeTransitionFrames,
 	generateHint,
-	nextEyeStyle,
 	randomBlinkDelay,
 	shouldRestoreLastSessionModel,
 } from "../extensions/context-hint";
@@ -19,6 +19,19 @@ const theme = new Proxy(
 	},
 	{ get: (target, key) => Reflect.get(target, key) },
 ) as any;
+
+test("lists Context Hint actions with descriptions", () => {
+	expect(contextHintArgumentCompletions("")).toContainEqual({
+		value: "reset-project",
+		label: "reset-project",
+		description: "Reset durable Project Context",
+	});
+	expect(contextHintArgumentCompletions("motion ")?.map(({ value }) => value)).toEqual([
+		"motion reduce",
+		"motion animate",
+	]);
+	expect(contextHintArgumentCompletions("unknown")).toBeNull();
+});
 
 test("restores last model only for fresh sessions", () => {
 	expect(shouldRestoreLastSessionModel("new", 0)).toBe(true);
@@ -203,15 +216,10 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	).resolves.toMatchObject({ attentionCue: { level: "none" } });
 });
 
-test("eye styles keep fixed state semantics and reduced motion static", () => {
-	expect(eyeGlyph("A", "open")).toBe("⊙");
-	expect(eyeGlyph("A", "half")).toBe("⊖");
-	expect(eyeGlyph("A", "closed")).toBe("─");
-	expect(eyeGlyph("B", "open")).toBe("◉");
-	expect(eyeGlyph("C", "closed")).toBe("[─]");
-	expect(nextEyeStyle("A")).toBe("B");
-	expect(nextEyeStyle("B")).toBe("C");
-	expect(nextEyeStyle("C")).toBe("A");
+test("eye animation keeps fixed state semantics and reduced motion static", () => {
+	expect(eyeGlyph("open")).toBe("◉");
+	expect(eyeGlyph("half")).toBe("◍");
+	expect(eyeGlyph("closed")).toBe("◡");
 	expect(eyeTransitionFrames(true)).toEqual(["closed", "half", "open"]);
 	expect(eyeTransitionFrames(false)).toEqual(["open", "half", "closed"]);
 	expect(eyeBlinkFrames()).toEqual(["open", "half", "closed", "half", "open"]);
@@ -220,7 +228,6 @@ test("eye styles keep fixed state semantics and reduced motion static", () => {
 
 	const record = pendingRecord();
 	const pending = contextHintCard(() => record, () => 9, true, theme, {
-		style: "A",
 		phase: "open",
 		motion: "reduce",
 	});
@@ -231,17 +238,51 @@ test("eye styles keep fixed state semantics and reduced motion static", () => {
 	record.sessionState = EMPTY_SESSION_STATE;
 	record.projectState = EMPTY_PROJECT_STATE;
 	const ready = contextHintCard(() => record, () => 0, true, theme, {
-		style: "A",
 		phase: "half",
 		motion: "animate",
 	});
-	expect(ready.render(48)[0]).toContain("⊖ CONTEXT HINT");
+	expect(ready.render(48)[0]).toContain("◍ CONTEXT HINT");
 	const reduced = contextHintCard(() => record, () => 0, true, theme, {
-		style: "A",
 		phase: "closed",
 		motion: "reduce",
 	});
-	expect(reduced.render(48)[0]).toContain("⊙ CONTEXT HINT");
+	expect(reduced.render(48)[0]).toContain("◉ CONTEXT HINT");
+});
+
+test("card reads live expansion and eye state on every render", () => {
+	const record = pendingRecord();
+	record.status = "ready";
+	record.hint = emptyHint();
+	record.sessionState = EMPTY_SESSION_STATE;
+	record.projectState = EMPTY_PROJECT_STATE;
+	let expanded = true;
+	let phase: "open" | "half" | "closed" = "open";
+	let motion: "animate" | "reduce" = "animate";
+	const card = contextHintCard(() => record, () => 0, () => expanded, theme, {
+		phase: () => phase,
+		motion: () => motion,
+	});
+
+	const openLines = card.render(48).join("\n");
+	expect(openLines).toContain("◉ CONTEXT HINT");
+	expect(openLines).toContain("PROJECT");
+	expect(openLines).toContain("alt+o · collapse");
+
+	expanded = false;
+	phase = "half";
+	const transitioningLines = card.render(48).join("\n");
+	expect(transitioningLines).toContain("◍ CONTEXT HINT");
+	expect(transitioningLines).not.toContain("PROJECT");
+	expect(transitioningLines).toContain("alt+o · expand");
+
+	phase = "closed";
+	const closedLines = card.render(48).join("\n");
+	expect(closedLines).toContain("◡ CONTEXT HINT");
+
+	expanded = true;
+	motion = "reduce";
+	phase = "closed";
+	expect(card.render(48).join("\n")).toContain("◉ CONTEXT HINT");
 });
 
 test("one card renders live loading, ready, and replacement error states within width", () => {
@@ -298,8 +339,8 @@ test("one card renders live loading, ready, and replacement error states within 
 	};
 	const expandedCard = contextHintCard(() => record, () => frame, true, theme);
 	const readyLines = expandedCard.render(48);
-	expect(readyLines.join("\n")).toContain("⊙ CONTEXT HINT");
-	expect(readyLines[0].startsWith("┏━━ ⊙ CONTEXT HINT")).toBe(true);
+	expect(readyLines.join("\n")).toContain("◉ CONTEXT HINT");
+	expect(readyLines[0].startsWith("┏━━ ◉ CONTEXT HINT")).toBe(true);
 	expect(readyLines.at(-1)).toContain("━");
 	expect(readyLines.some((line) => line.includes("┃"))).toBe(true);
 	expect(readyLines.join("\n")).toContain("Implemented Context Hint");
@@ -316,7 +357,7 @@ test("one card renders live loading, ready, and replacement error states within 
 	const collapsedReadyLines = card.render(48);
 	expect(collapsedReadyLines).toHaveLength(2);
 	expect(collapsedReadyLines.at(-1)).toContain(" alt+o · expand ▼ ");
-	expect(collapsedReadyLines[0]).toContain("─ CONTEXT HINT");
+	expect(collapsedReadyLines[0]).toContain("◡ CONTEXT HINT");
 	expect(collapsedReadyLines.join("\n")).not.toContain("Implemented Context Hint");
 
 	const narrowExpandedLines = expandedCard.render(12);

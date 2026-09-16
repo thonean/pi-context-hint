@@ -9,7 +9,7 @@ import {
 	type Theme,
 	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AutocompleteItem, type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONTEXT_HINT_SETTINGS,
@@ -59,24 +59,41 @@ const SPINNER_INTERVAL_MS = 80;
 const EYE_FRAME_INTERVAL_MS = 120;
 const BLINK_MIN_DELAY_MS = 5_000;
 const BLINK_MAX_DELAY_MS = 10_000;
-const PREVIEW_STATUS_KEY = "context-hint-eye-preview";
 const MAX_TOOL_FACTS = 24;
 
-export type EyeStyle = "A" | "B" | "C";
-export type EyePhase = "open" | "half" | "closed";
+const CONTEXT_HINT_ACTIONS = [
+	{ value: "status", description: "Show current configuration" },
+	{ value: "enable", description: "Enable future Context Hint cards" },
+	{ value: "disable", description: "Disable generation and keep existing state" },
+	{ value: "model", description: "Choose the generation model" },
+	{ value: "regenerate", description: "Regenerate the latest settled hint" },
+	{ value: "toggle", description: "Expand or collapse Context Hint cards" },
+	{ value: "motion reduce", description: "Disable spinner and eye animation" },
+	{ value: "motion animate", description: "Enable spinner and eye animation" },
+	{ value: "reset-session", description: "Reset rolling Session Context" },
+	{ value: "reset-project", description: "Reset durable Project Context" },
+] as const;
 
-export const EYE_STYLES: Record<EyeStyle, Record<EyePhase, string>> = {
-	A: { open: "⊙", half: "⊖", closed: "─" },
-	B: { open: "◉", half: "◍", closed: "◡" },
-	C: { open: "[●]", half: "[•]", closed: "[─]" },
-};
-
-export function eyeGlyph(style: EyeStyle, phase: EyePhase): string {
-	return EYE_STYLES[style][phase];
+export function contextHintArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+	const normalizedPrefix = prefix.trimStart();
+	const matches = CONTEXT_HINT_ACTIONS.filter(({ value }) => value.startsWith(normalizedPrefix)).map(({ value, description }) => ({
+		value,
+		label: value,
+		description,
+	}));
+	return matches.length > 0 ? matches : null;
 }
 
-export function nextEyeStyle(style: EyeStyle): EyeStyle {
-	return style === "A" ? "B" : style === "B" ? "C" : "A";
+export type EyePhase = "open" | "half" | "closed";
+
+const EYE_GLYPHS: Record<EyePhase, string> = {
+	open: "◉",
+	half: "◍",
+	closed: "◡",
+};
+
+export function eyeGlyph(phase: EyePhase): string {
+	return EYE_GLYPHS[phase];
 }
 
 export function randomBlinkDelay(random = Math.random): number {
@@ -211,11 +228,9 @@ export default function (pi: ExtensionAPI) {
 	const controllers = new Map<string, AbortController>();
 	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
 	let spinnerFrame = 0;
-	let eyeStyle: EyeStyle = "A";
 	let eyePhase: EyePhase = "open";
 	let eyeTimer: ReturnType<typeof setTimeout> | undefined;
 	let eyeAnimationTimer: ReturnType<typeof setInterval> | undefined;
-	let previewActive = false;
 
 	pi.registerEntryRenderer<EntryData>(ENTRY_TYPE, (entry, _options, theme) => {
 		const data = entry.data;
@@ -224,12 +239,11 @@ export default function (pi: ExtensionAPI) {
 		return contextHintCard(
 			() => records.get(generationId),
 			() => spinnerFrame,
-			settings.expanded,
+			() => settings.expanded,
 			theme,
 			{
-				style: previewActive ? eyeStyle : "A",
-				phase: eyePhase,
-				motion: previewActive ? "animate" : settings.motion,
+				phase: () => eyePhase,
+				motion: () => settings.motion,
 			},
 		);
 	});
@@ -243,12 +257,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		clearAnimationTimers();
-		previewActive = false;
-		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
 		closed = false;
 		activeSessionId = ctx.sessionManager.getSessionId();
 		settings = await readContextHintSettings(getAgentDir());
-		eyeStyle = "A";
 		eyePhase = settings.expanded ? "open" : "closed";
 		project = await resolveProjectIdentity(pi, ctx.cwd);
 		config = await readConfig(project.paths);
@@ -334,19 +345,25 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event, ctx) => {
 		closed = true;
 		clearAnimationTimers();
-		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
 		await cancelPending(`Generation interrupted by session ${event.reason}.`, ctx);
 	});
 
 	pi.registerCommand("context-hint", {
 		description: "Configure, regenerate, or reset Context Hint",
+		getArgumentCompletions: contextHintArgumentCompletions,
 		handler: async (args, ctx) => {
 			if (!project || !projectDocument) {
 				ctx.ui.notify("Context Hint is not initialized", "error");
 				return;
 			}
-			const action = args.trim();
+			let action = args.trim();
 			if (!action) {
+				const choices = CONTEXT_HINT_ACTIONS.map(({ value, description }) => `${value} — ${description}`);
+				const selected = await ctx.ui.select("Context Hint", choices);
+				action = CONTEXT_HINT_ACTIONS[choices.indexOf(selected ?? "")]?.value ?? "";
+				if (!action) return;
+			}
+			if (action === "status") {
 				showStatus(ctx, config, settings, project);
 				return;
 			}
@@ -356,14 +373,6 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (action === "motion reduce" || action === "motion animate") {
 				await setMotion(action.endsWith("reduce") ? "reduce" : "animate", ctx);
-				return;
-			}
-			if (action === "eye-preview start") {
-				await startEyePreview(ctx);
-				return;
-			}
-			if (action === "eye-preview stop") {
-				stopEyePreview(ctx);
 				return;
 			}
 			if (action === "enable") {
@@ -412,7 +421,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				"Usage: /context-hint [enable|disable|model|regenerate|toggle|motion reduce|motion animate|eye-preview start|eye-preview stop|reset-session|reset-project]",
+				"Usage: /context-hint [status|enable|disable|model|regenerate|toggle|motion reduce|motion animate|reset-session|reset-project]",
 				"warning",
 			);
 		},
@@ -565,7 +574,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function syncEyeAnimation(ctx: ExtensionContext): void {
-		const blocked = !hasReadyRecords() || hasPendingRecords() || closed || !settings.expanded || (!previewActive && settings.motion === "reduce");
+		const blocked = !hasReadyRecords() || hasPendingRecords() || closed || !settings.expanded || settings.motion === "reduce";
 		if (blocked) {
 			if (eyeTimer) clearTimeout(eyeTimer);
 			if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
@@ -578,18 +587,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function scheduleEyeBlink(ctx: ExtensionContext): void {
-		if (!settings.expanded || closed || hasPendingRecords() || (!previewActive && settings.motion === "reduce")) return;
+		if (!settings.expanded || closed || hasPendingRecords() || settings.motion === "reduce") return;
 		if (eyeTimer) clearTimeout(eyeTimer);
 		eyeTimer = setTimeout(() => {
 			eyeTimer = undefined;
-			runBlink(ctx, () => {
-				if (previewActive) {
-					eyeStyle = nextEyeStyle(eyeStyle);
-					ctx.ui.setStatus(PREVIEW_STATUS_KEY, `Eye preview: ${eyeStyle}`);
-					pulse(ctx);
-				}
-				scheduleEyeBlink(ctx);
-			});
+			runBlink(ctx, () => scheduleEyeBlink(ctx));
 		}, randomBlinkDelay());
 	}
 
@@ -618,7 +620,7 @@ export default function (pi: ExtensionAPI) {
 		if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
 		eyeTimer = undefined;
 		eyeAnimationTimer = undefined;
-		if (hasPendingRecords() || (settings.motion === "reduce" && !previewActive)) {
+		if (hasPendingRecords() || settings.motion === "reduce") {
 			eyePhase = nextExpanded ? "open" : "closed";
 			pulse(ctx);
 			return;
@@ -653,7 +655,7 @@ export default function (pi: ExtensionAPI) {
 	async function setMotion(motion: ContextHintMotion, ctx: ExtensionContext): Promise<void> {
 		settings = { ...settings, motion };
 		await writeContextHintSettings(getAgentDir(), settings);
-		if (motion === "reduce" && !previewActive) {
+		if (motion === "reduce") {
 			if (eyeTimer) clearTimeout(eyeTimer);
 			if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
 			eyeTimer = undefined;
@@ -667,45 +669,6 @@ export default function (pi: ExtensionAPI) {
 		pulse(ctx);
 	}
 
-	async function startEyePreview(ctx: ExtensionContext): Promise<void> {
-		if (previewActive) {
-			ctx.ui.notify("Eye preview already running", "warning");
-			return;
-		}
-		if (!hasReadyRecords()) {
-			ctx.ui.notify("Generate a ready Context Hint before starting eye preview", "warning");
-			return;
-		}
-		// Temporary comparison preview; remove after final eye glyph selection.
-		previewActive = true;
-		eyeStyle = "A";
-		eyePhase = settings.expanded ? "open" : "closed";
-		ctx.ui.setStatus(PREVIEW_STATUS_KEY, "Eye preview: A");
-		clearEyeTimers();
-		if (settings.expanded) scheduleEyeBlink(ctx);
-		pulse(ctx);
-	}
-
-	function stopEyePreview(ctx: ExtensionContext): void {
-		if (!previewActive) {
-			ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
-			return;
-		}
-		previewActive = false;
-		clearEyeTimers();
-		eyeStyle = "A";
-		eyePhase = settings.expanded ? "open" : "closed";
-		ctx.ui.setStatus(PREVIEW_STATUS_KEY, undefined);
-		syncEyeAnimation(ctx);
-		pulse(ctx);
-	}
-
-	function clearEyeTimers(): void {
-		if (eyeTimer) clearTimeout(eyeTimer);
-		if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
-		eyeTimer = undefined;
-		eyeAnimationTimer = undefined;
-	}
 
 	async function rememberSessionModel(model: Model<Api>): Promise<void> {
 		if (!project || !config.enabled) return;
@@ -1064,31 +1027,39 @@ function pulse(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, undefined);
 }
 
+type LiveValue<T> = T | (() => T);
+
 export interface ContextHintCardAnimation {
-	style: EyeStyle;
-	phase: EyePhase;
-	motion: ContextHintMotion;
+	phase: LiveValue<EyePhase>;
+	motion: LiveValue<ContextHintMotion>;
+}
+
+function resolveLiveValue<T>(value: LiveValue<T>): T {
+	return typeof value === "function" ? (value as () => T)() : value;
 }
 
 export function contextHintCard(
 	getRecord: () => GenerationRecord | undefined,
 	getFrame: () => number,
-	expanded: boolean,
+	expanded: LiveValue<boolean>,
 	theme: Theme,
-	animation: ContextHintCardAnimation = {
-		style: "A",
-		phase: expanded ? "open" : "closed",
-		motion: "animate",
-	},
+	animation?: ContextHintCardAnimation,
 ): Component {
+	const liveAnimation = animation ?? {
+		phase: () => (resolveLiveValue(expanded) ? "open" : "closed") as EyePhase,
+		motion: "animate" as const,
+	};
 	return {
 		invalidate() {},
 		render(width) {
 			const record = getRecord();
 			const frame = getFrame();
+			const isExpanded = resolveLiveValue(expanded);
+			const motion = resolveLiveValue(liveAnimation.motion);
+			const phase = resolveLiveValue(liveAnimation.phase);
 			const isPending = record?.status === "pending";
 			if (isPending) {
-				const spinner = theme.fg("accent", SPINNER[animation.motion === "reduce" ? 0 : frame % SPINNER.length]);
+				const spinner = theme.fg("accent", SPINNER[motion === "reduce" ? 0 : frame % SPINNER.length]);
 				const label = theme.fg("muted", "GENERATING CONTEXT HINT");
 				return [truncateToWidth(`${spinner} ${label}`, width, "")];
 			}
@@ -1100,10 +1071,10 @@ export function contextHintCard(
 			const isReady = !isError;
 			const borderColor: ThemeColor = isError ? "borderMuted" : "accent";
 			const titleColor: ThemeColor = isError ? "error" : "success";
-			const eyePhase = !expanded ? "closed" : animation.motion === "reduce" ? "open" : animation.phase;
+			const eyePhase = motion === "reduce" ? (isExpanded ? "open" : "closed") : phase;
 			const style = isError
 				? { borderColor, titleColor, horizontal: "─", vertical: "│", topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", title: "✕ ERROR" }
-				: { borderColor, titleColor, horizontal: "━", vertical: "┃", topLeft: "┏", topRight: "┓", bottomLeft: "┗", bottomRight: "┛", title: `${eyeGlyph(animation.style, eyePhase)} CONTEXT HINT` };
+				: { borderColor, titleColor, horizontal: "━", vertical: "┃", topLeft: "┏", topRight: "┓", bottomLeft: "┗", bottomRight: "┛", title: `${eyeGlyph(eyePhase)} CONTEXT HINT` };
 			const border = (left: string, fill: string, right: string) =>
 				theme.fg(style.borderColor, left + fill.repeat(cardWidth - 2) + right);
 			const bottomBorder = (action?: "collapse" | "expand") => {
@@ -1129,7 +1100,7 @@ export function contextHintCard(
 					const inset = " ".repeat(contentPadding);
 					return `${theme.fg(style.borderColor, style.vertical)}${inset}${wrapped}${padding}${inset}${theme.fg(style.borderColor, style.vertical)}`;
 				});
-			const lines: Array<string | string[]> = [topBorder(), ...(isReady && !expanded ? [] : line())];
+			const lines: Array<string | string[]> = [topBorder(), ...(isReady && !isExpanded ? [] : line())];
 
 			if (isError) {
 				lines.push(
@@ -1137,7 +1108,7 @@ export function contextHintCard(
 					line(),
 					line(theme.fg("muted", "/context-hint regenerate")),
 				);
-			} else if (expanded) {
+			} else if (isExpanded) {
 				const hint = record.hint!;
 				const session = record.sessionState!;
 				const project = record.projectState!;
@@ -1191,8 +1162,8 @@ export function contextHintCard(
 					for (const detail of details.slice(0, 6)) lines.push(line(theme.fg("dim", detail)));
 				}
 			}
-			if (!isReady || expanded) lines.push(line());
-			lines.push(bottomBorder(isReady ? (expanded ? "collapse" : "expand") : undefined));
+			if (!isReady || isExpanded) lines.push(line());
+			lines.push(bottomBorder(isReady ? (isExpanded ? "collapse" : "expand") : undefined));
 			return lines.flat();
 		},
 	};

@@ -48,7 +48,8 @@ Use `alt+o` to expand or collapse Context Hint cards.
 
 | Command | Purpose |
 | --- | --- |
-| `/context-hint` | Show current configuration |
+| `/context-hint` | Open the command menu |
+| `/context-hint status` | Show current configuration |
 | `/context-hint enable` | Enable future Context Hint cards |
 | `/context-hint disable` | Disable generation while keeping existing state |
 | `/context-hint model` | Choose the generation model |
@@ -56,8 +57,6 @@ Use `alt+o` to expand or collapse Context Hint cards.
 | `/context-hint toggle` | Expand or collapse Context Hint cards |
 | `/context-hint motion reduce` | Disable spinner and eye animation |
 | `/context-hint motion animate` | Enable spinner and eye animation |
-| `/context-hint eye-preview start` | Preview the available eye glyph styles |
-| `/context-hint eye-preview stop` | Stop the eye glyph preview |
 | `/context-hint reset-session` | Reset rolling Session Context |
 | `/context-hint reset-project` | Reset durable Project Context for this project |
 
