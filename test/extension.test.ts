@@ -1,14 +1,31 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { EMPTY_PROJECT_STATE, EMPTY_SESSION_STATE, type GenerationRecord } from "../src/core";
+import {
+	DEFAULT_CONFIG,
+	DEFAULT_CONTEXT_HINT_SETTINGS,
+	EMPTY_PROJECT_STATE,
+	EMPTY_SESSION_STATE,
+	ENTRY_TYPE,
+	latestGenerationRecord,
+	projectPaths,
+	writeConfig,
+	writeContextHintSettings,
+	writeGeneration,
+	type GenerationRecord,
+} from "../src/core";
 import {
 	contextHintArgumentCompletions,
 	contextHintCard,
+	contextHintStatus,
 	eyeBlinkFrames,
 	eyeGlyph,
 	eyeTransitionFrames,
 	generateHint,
 	randomBlinkDelay,
+	randomCollapsedPeekDelay,
 	shouldRestoreLastSessionModel,
 } from "../extensions/context-hint";
 
@@ -30,6 +47,11 @@ test("lists Context Hint actions with descriptions", () => {
 		"motion reduce",
 		"motion animate",
 	]);
+	expect(contextHintArgumentCompletions("toggle")).toContainEqual({
+		value: "toggle",
+		label: "toggle",
+		description: "Expand or collapse cards (Alt+O)",
+	});
 	expect(contextHintArgumentCompletions("unknown")).toBeNull();
 });
 
@@ -216,15 +238,23 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	).resolves.toMatchObject({ attentionCue: { level: "none" } });
 });
 
-test("eye animation keeps fixed state semantics and reduced motion static", () => {
-	expect(eyeGlyph("open")).toBe("◉");
-	expect(eyeGlyph("half")).toBe("◍");
-	expect(eyeGlyph("closed")).toBe("◡");
-	expect(eyeTransitionFrames(true)).toEqual(["closed", "half", "open"]);
-	expect(eyeTransitionFrames(false)).toEqual(["open", "half", "closed"]);
-	expect(eyeBlinkFrames()).toEqual(["open", "half", "closed", "half", "open"]);
+test("eye animation uses approved three-cell frames and reduced motion stays static", () => {
+	expect(eyeGlyph("open")).toBe("⠢⣋⠔");
+	expect(eyeGlyph("half")).toBe("⠔⣖⠢");
+	expect(eyeGlyph("slit")).toBe("⠠⡤⠄");
+	expect(eyeGlyph("closed")).toBe("⢄⣀⡠");
+	for (const phase of ["open", "half", "slit", "closed"] as const) {
+		const frame = eyeGlyph(phase);
+		expect([...frame]).toHaveLength(3);
+		expect(visibleWidth(frame)).toBe(3);
+	}
+	expect(eyeTransitionFrames(true)).toEqual(["closed", "slit", "half", "open"]);
+	expect(eyeTransitionFrames(false)).toEqual(["open", "half", "slit", "closed"]);
+	expect(eyeBlinkFrames()).toEqual(["open", "half", "slit", "closed", "slit", "half", "open"]);
 	expect(randomBlinkDelay(() => 0)).toBe(5_000);
 	expect(randomBlinkDelay(() => 1 - Number.EPSILON)).toBe(10_000);
+	expect(randomCollapsedPeekDelay(() => 0)).toBe(8_000);
+	expect(randomCollapsedPeekDelay(() => 1 - Number.EPSILON)).toBe(12_000);
 
 	const record = pendingRecord();
 	const pending = contextHintCard(() => record, () => 9, true, theme, {
@@ -241,12 +271,18 @@ test("eye animation keeps fixed state semantics and reduced motion static", () =
 		phase: "half",
 		motion: "animate",
 	});
-	expect(ready.render(48)[0]).toContain("◍ CONTEXT HINT");
+	expect(ready.render(48)[0]).toContain("⠔⣖⠢ CONTEXT HINT");
 	const reduced = contextHintCard(() => record, () => 0, true, theme, {
 		phase: "closed",
 		motion: "reduce",
 	});
-	expect(reduced.render(48)[0]).toContain("◉ CONTEXT HINT");
+	expect(reduced.render(48)[0]).toContain("⠢⣋⠔ CONTEXT HINT");
+	const disabled = contextHintCard(() => record, () => 0, true, theme, {
+		phase: "open",
+		motion: "reduce",
+		enabled: false,
+	});
+	expect(disabled.render(48)[0]).toContain("⢄⣀⡠ CONTEXT HINT");
 });
 
 test("card reads live expansion and eye state on every render", () => {
@@ -256,7 +292,7 @@ test("card reads live expansion and eye state on every render", () => {
 	record.sessionState = EMPTY_SESSION_STATE;
 	record.projectState = EMPTY_PROJECT_STATE;
 	let expanded = true;
-	let phase: "open" | "half" | "closed" = "open";
+	let phase: "open" | "half" | "slit" | "closed" = "open";
 	let motion: "animate" | "reduce" = "animate";
 	const card = contextHintCard(() => record, () => 0, () => expanded, theme, {
 		phase: () => phase,
@@ -264,31 +300,52 @@ test("card reads live expansion and eye state on every render", () => {
 	});
 
 	const openLines = card.render(48).join("\n");
-	expect(openLines).toContain("◉ CONTEXT HINT");
+	expect(openLines).toContain("⠢⣋⠔ CONTEXT HINT");
 	expect(openLines).toContain("PROJECT");
-	expect(openLines).toContain("alt+o · collapse");
+	expect(openLines).not.toContain("alt+o");
 
 	expanded = false;
 	phase = "half";
 	const transitioningLines = card.render(48).join("\n");
-	expect(transitioningLines).toContain("◍ CONTEXT HINT");
+	expect(transitioningLines).toContain("≡ CONTEXT HINT · Card collapsed");
 	expect(transitioningLines).not.toContain("PROJECT");
-	expect(transitioningLines).toContain("alt+o · expand");
+	expect(transitioningLines).not.toContain("◍");
+	expect(transitioningLines).not.toContain("alt+o");
 
 	phase = "closed";
 	const closedLines = card.render(48).join("\n");
-	expect(closedLines).toContain("◡ CONTEXT HINT");
+	expect(closedLines).toContain("≡ CONTEXT HINT · Card collapsed");
 
 	expanded = true;
 	motion = "reduce";
 	phase = "closed";
-	expect(card.render(48).join("\n")).toContain("◉ CONTEXT HINT");
+	expect(card.render(48).join("\n")).toContain("⠢⣋⠔ CONTEXT HINT");
+});
+
+test("collapsed pending, ready, error, and missing cards render one safe line", () => {
+	const pending = pendingRecord();
+	const ready = { ...pending, status: "ready" as const };
+	const error = { ...pending, status: "error" as const, error: "secret failure detail" };
+	for (const record of [pending, ready, error, undefined]) {
+		const card = contextHintCard(() => record, () => 5, false, theme);
+		for (let width = 1; width <= 48; width++) {
+			const lines = card.render(width);
+			expect(lines).toHaveLength(1);
+			expect(visibleWidth(lines[0])).toBeLessThanOrEqual(width);
+			expect(lines.join("\n")).not.toContain("┏");
+			expect(lines.join("\n")).not.toContain("⠋");
+			expect(lines.join("\n")).not.toContain("ERROR");
+			expect(lines.join("\n")).not.toContain("secret failure detail");
+			expect(lines.join("\n")).not.toContain("alt+o");
+		}
+		expect(card.render(48)[0]).toContain("≡ CONTEXT HINT · Card collapsed");
+	}
 });
 
 test("one card renders live loading, ready, and replacement error states within width", () => {
 	let record = pendingRecord();
 	let frame = 0;
-	const card = contextHintCard(() => record, () => frame, false, theme);
+	const card = contextHintCard(() => record, () => frame, true, theme);
 	const loadingLines = card.render(48);
 	expect(loadingLines).toEqual(["⠋ GENERATING CONTEXT HINT"]);
 	expect(loadingLines.join("\n")).not.toContain(".");
@@ -339,8 +396,8 @@ test("one card renders live loading, ready, and replacement error states within 
 	};
 	const expandedCard = contextHintCard(() => record, () => frame, true, theme);
 	const readyLines = expandedCard.render(48);
-	expect(readyLines.join("\n")).toContain("◉ CONTEXT HINT");
-	expect(readyLines[0].startsWith("┏━━ ◉ CONTEXT HINT")).toBe(true);
+	expect(readyLines.join("\n")).toContain("⠢⣋⠔ CONTEXT HINT");
+	expect(readyLines[0].startsWith("┏━━ ⠢⣋⠔ CONTEXT HINT")).toBe(true);
 	expect(readyLines.at(-1)).toContain("━");
 	expect(readyLines.some((line) => line.includes("┃"))).toBe(true);
 	expect(readyLines.join("\n")).toContain("Implemented Context Hint");
@@ -351,17 +408,18 @@ test("one card renders live loading, ready, and replacement error states within 
 	expect(readyLines.join("\n")).toContain("T test/extension.test.ts");
 	expect(readyLines.join("\n")).toContain("Protects narrow-card rendering");
 	expect(readyLines.every((line) => visibleWidth(line) <= 48)).toBe(true);
-	expect(readyLines.at(-1)).toContain(" alt+o · collapse ▲ ");
+	expect(readyLines.join("\n")).not.toContain("alt+o");
 	expect(readyLines.join("\n")).toContain("DETAIL");
 
-	const collapsedReadyLines = card.render(48);
-	expect(collapsedReadyLines).toHaveLength(2);
-	expect(collapsedReadyLines.at(-1)).toContain(" alt+o · expand ▼ ");
-	expect(collapsedReadyLines[0]).toContain("◡ CONTEXT HINT");
+	const collapsedCard = contextHintCard(() => record, () => frame, false, theme);
+	const collapsedReadyLines = collapsedCard.render(48);
+	expect(collapsedReadyLines).toHaveLength(1);
+	expect(collapsedReadyLines[0]).toContain("≡ CONTEXT HINT · Card collapsed");
+	expect(collapsedReadyLines.join("\n")).not.toContain("◡");
 	expect(collapsedReadyLines.join("\n")).not.toContain("Implemented Context Hint");
+	expect(collapsedReadyLines.every((line) => visibleWidth(line) <= 48)).toBe(true);
 
 	const narrowExpandedLines = expandedCard.render(12);
-	expect(narrowExpandedLines.at(-1)).toContain(" ▲ ");
 	expect(narrowExpandedLines.at(-1)).not.toContain("alt+o");
 	expect(narrowExpandedLines.at(-1)).not.toContain("collapse");
 	expect(narrowExpandedLines.every((line) => visibleWidth(line) <= 12)).toBe(true);
@@ -376,12 +434,365 @@ test("one card renders live loading, ready, and replacement error states within 
 	expect(expandedCard.render(48).join("\n")).not.toContain("CODE CUES");
 
 	record = { ...record, status: "error", error: "failed" };
-	const errorLines = card.render(48);
+	const errorLines = expandedCard.render(48);
 	expect(errorLines.join("\n")).toContain("✕ ERROR");
 	expect(errorLines.join("\n")).not.toContain("collapse");
 	expect(errorLines.join("\n")).not.toContain("expand");
 	expect(errorLines[0].startsWith("╭── ✕ ERROR")).toBe(true);
 	expect(errorLines.at(-1)).toContain("─");
+});
+
+test("footer status stays compact and prioritizes current work and actual expansion", () => {
+	const pending = { ...pendingRecord(), status: "pending" as const };
+	const failed = { ...pendingRecord(), status: "error" as const, error: "failed" };
+	const ready = { ...pendingRecord(), status: "ready" as const };
+	const status = (expanded: boolean, enabled: boolean, record: GenerationRecord | undefined, phase: "open" | "half" | "slit" | "closed" = "closed", motion: "animate" | "reduce" = "animate") =>
+		contextHintStatus({ expanded, motion }, enabled, record, "session", phase, theme);
+
+	expect(status(false, true, pending)).toBe("⢄⣀⡠ context-hint: generating");
+	expect(status(true, true, failed, "half")).toBe("⠔⣖⠢ context-hint: error");
+	expect(status(false, true, { ...pending, sessionId: "parent" })).toBe("⢄⣀⡠ context-hint: collapsed");
+	expect(status(true, true, { ...failed, sessionId: "parent" }, "half")).toBe("⠔⣖⠢ context-hint: error");
+	expect(status(false, false, pending)).toBe("⢄⣀⡠ context-hint: disabled");
+	expect(status(true, false, failed, "half")).toBe("⢄⣀⡠ context-hint: disabled");
+	expect(status(true, true, ready, "half")).toBe("⠔⣖⠢ context-hint: expanded");
+	expect(status(false, true, ready, "half", "reduce")).toBe("⢄⣀⡠ context-hint: collapsed");
+	expect(status(true, true, ready, "half", "reduce")).toBe("⠢⣋⠔ context-hint: expanded");
+	expect(status(true, true, undefined)).toBe("⢄⣀⡠ context-hint: expanded");
+	expect(status(true, true, ready, "open")).toBe("⠢⣋⠔ context-hint: expanded");
+	expect(visibleWidth(status(true, true, ready, "open"))).toBe(26);
+
+	const oldError = { ...failed, generationId: "old" };
+	const newestReady = { ...ready, generationId: "new" };
+	const latest = latestGenerationRecord(
+		[
+			{ type: "custom", customType: ENTRY_TYPE, data: { kind: "hint", generationId: "old" } },
+			{ type: "custom", customType: ENTRY_TYPE, data: { kind: "hint", generationId: "new" } },
+		],
+		new Map<string, GenerationRecord>([["old", oldError], ["new", newestReady]]),
+	);
+	expect(status(true, true, latest)).toBe("⢄⣀⡠ context-hint: expanded");
+	expect(status(true, true, latest)).not.toContain("error");
+
+	const colorCalls: string[] = [];
+	const footerTheme = {
+		bold: (_text: string) => { throw new Error("footer name and state must not be bold"); },
+		fg: (color: string, text: string) => { colorCalls.push(`${color}:${text}`); return text; },
+	} as any;
+	contextHintStatus({ expanded: true, motion: "animate" }, true, ready, "session", "open", footerTheme);
+	expect(colorCalls).toContain("muted:context-hint");
+	expect(colorCalls).toContain("dim::");
+	expect(colorCalls).toContain("muted:expanded");
+	colorCalls.length = 0;
+	contextHintStatus({ expanded: false, motion: "animate" }, true, ready, "session", "closed", footerTheme);
+	expect(colorCalls).toContain("muted:collapsed");
+	colorCalls.length = 0;
+	contextHintStatus({ expanded: false, motion: "animate" }, true, pending, "session", "closed", footerTheme);
+	expect(colorCalls).toContain("accent:generating");
+	colorCalls.length = 0;
+	contextHintStatus({ expanded: false, motion: "animate" }, true, failed, "session", "closed", footerTheme);
+	expect(colorCalls).toContain("error:error");
+	colorCalls.length = 0;
+	contextHintStatus({ expanded: false, motion: "animate" }, false, ready, "session", "closed", footerTheme);
+	expect(colorCalls).toContain("muted:disabled");
+});
+
+test("eye and title contrast keep shortcuts subdued", () => {
+	const colors: string[] = [];
+	const themed = {
+		bold: (text: string) => text,
+		fg: (color: string, text: string) => {
+			colors.push(`${color}:${text}`);
+			return text;
+		},
+	} as any;
+	contextHintStatus({ expanded: true, motion: "animate" }, true, undefined, "session", "open", themed);
+	const record = { ...pendingRecord(), status: "ready" as const, hint: emptyHint(), sessionState: EMPTY_SESSION_STATE, projectState: EMPTY_PROJECT_STATE };
+	contextHintCard(() => record, () => 0, true, themed, { phase: "open", motion: "animate" }).render(48);
+	contextHintCard(() => undefined, () => 0, false, themed).render(48);
+	expect(colors).toContain("muted:context-hint");
+	expect(colors).toContain("dim::");
+	expect(colors).toContain("muted:expanded");
+	expect(colors).toContain("muted:⠢");
+	expect(colors).toContain("accent:⣋");
+	expect(colors).toContain("muted:⠔");
+	expect(colors).toContain("success:CONTEXT HINT");
+	expect(colors).toContain("muted:≡ ");
+	expect(colors).toContain("accent:CONTEXT HINT");
+	expect(colors).toContain("muted: · Card collapsed");
+
+	const ansiColors: Record<string, string> = { muted: "38;5;244", accent: "38;5;208", success: "38;5;34", dim: "38;5;242", error: "38;5;196", borderMuted: "38;5;240" };
+	const ansiTheme = {
+		bold: (text: string) => `\u001b[1m${text}\u001b[0m`,
+		fg: (color: string, text: string) => `\u001b[${ansiColors[color]}m${text}\u001b[0m`,
+	} as any;
+	const ansiStatus = contextHintStatus({ expanded: true, motion: "animate" }, true, undefined, "session", "open", ansiTheme);
+	const ansiCard = contextHintCard(() => record, () => 0, true, ansiTheme, { phase: "open", motion: "animate" }).render(48)[0];
+	const sprite = "\u001b[38;5;244m⠢\u001b[0m\u001b[38;5;208m⣋\u001b[0m\u001b[38;5;244m⠔\u001b[0m";
+	expect(ansiStatus).toContain(sprite);
+	expect(visibleWidth(ansiStatus)).toBe(26);
+	expect(ansiCard).toContain(sprite);
+	expect(ansiStatus.indexOf("\u001b[38;5;244mcontext-hint")).toBeGreaterThan(ansiStatus.indexOf(sprite));
+	expect(ansiCard.indexOf("\u001b[38;5;34m\u001b[1mCONTEXT HINT")).toBeGreaterThan(ansiCard.indexOf(sprite));
+});
+
+test("one shared eye phase drives expanded card title and footer status", () => {
+	const record = pendingRecord();
+	record.status = "ready";
+	record.hint = emptyHint();
+	record.sessionState = EMPTY_SESSION_STATE;
+	record.projectState = EMPTY_PROJECT_STATE;
+	const card = contextHintCard(() => record, () => 0, true, theme, { phase: "half", motion: "animate" });
+	const status = contextHintStatus({ expanded: true, motion: "animate" }, true, record, "session", "half", theme);
+	expect(card.render(48)[0]).toContain("⠔⣖⠢ CONTEXT HINT");
+	expect(status).toContain("⠔⣖⠢ context-hint: expanded");
+});
+
+test("footer eye stays synced across collapsed peeks, expanded blinks, and session cleanup", async () => {
+	const temp = await mkdtemp(join(tmpdir(), "context-hint-timers-"));
+	const agentDir = join(temp, "agent");
+	const cwd = join(temp, "project");
+	await mkdir(cwd);
+	await writeFile(join(cwd, "README.md"), "test project");
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+
+	const originalRandom = Math.random;
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	let nextId = 0;
+	const timers = new Map<number, { callback: () => void; delay: number; interval: boolean }>();
+	const addTimer = (callback: () => void, delay: number, interval: boolean) => {
+		const id = ++nextId;
+		timers.set(id, { callback, delay, interval });
+		return { id } as any;
+	};
+	const clearTimer = (timer: unknown) => timers.delete((timer as { id: number }).id);
+	const fireTimer = (delay: number) => {
+		const [id, timer] = [...timers].find(([, item]) => item.delay === delay)!;
+		if (!timer.interval) timers.delete(id);
+		timer.callback();
+	};
+	let sessionId = "first";
+	const entries: any[] = [];
+	const statuses = new Map<string, string>();
+	const notifications: Array<{ message: string; level: string }> = [];
+	const menuChoices: string[][] = [];
+	const listeners = new Map<string, (event: any, ctx: any) => any>();
+	const commands = new Map<string, (args: string, ctx: any) => any>();
+	const shortcuts = new Map<string, (ctx: any) => any>();
+	const renderers = new Map<string, (entry: any, options: any, theme: any) => any>();
+	const ctx = {
+		hasUI: true,
+		mode: "tui",
+		cwd,
+		model: undefined,
+		modelRegistry: {},
+		scopedModels: [],
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getEntries: () => entries,
+			getBranch: () => entries,
+		},
+		ui: {
+			theme,
+			notify: (message: string, level: string) => notifications.push({ message, level }),
+			select: async (_title: string, choices: string[]) => {
+				menuChoices.push(choices);
+				return undefined;
+			},
+			setStatus: (key: string, value: string | undefined) => {
+				if (value === undefined) statuses.delete(key);
+				else statuses.set(key, value);
+			},
+		},
+	} as any;
+	const pi = {
+		on: (name: string, listener: (event: any, ctx: any) => any) => listeners.set(name, listener),
+		registerCommand: (name: string, command: { handler: (args: string, ctx: any) => any }) => commands.set(name, command.handler),
+		registerEntryRenderer: (type: string, renderer: (entry: any, options: any, theme: any) => any) => renderers.set(type, renderer),
+		registerShortcut: (key: string, shortcut: { handler: (ctx: any) => any }) => shortcuts.set(key, shortcut.handler),
+		appendEntry: () => {},
+		exec: async () => ({ code: 1, stdout: "", stderr: "" }),
+	};
+
+	try {
+		Math.random = () => 0;
+		globalThis.setTimeout = ((callback: () => void, delay = 0) => addTimer(callback, delay, false)) as any;
+		globalThis.clearTimeout = clearTimer as any;
+		globalThis.setInterval = ((callback: () => void, delay = 0) => addTimer(callback, delay, true)) as any;
+		globalThis.clearInterval = clearTimer as any;
+		const paths = projectPaths(agentDir, `dir:${await realpath(cwd)}`);
+		await writeConfig(paths, { ...DEFAULT_CONFIG, enabled: true });
+		await writeContextHintSettings(agentDir, { ...DEFAULT_CONTEXT_HINT_SETTINGS, expanded: false });
+
+		const { default: registerContextHint } = await import("../extensions/context-hint");
+		registerContextHint(pi as any);
+		await listeners.get("session_start")!({ reason: "resume" }, ctx);
+		expect(notifications).toEqual([]);
+		await commands.get("context-hint")!("", ctx);
+		expect(menuChoices.at(-1)).toContain("toggle — Expand or collapse cards (Alt+O)");
+		expect(notifications).toEqual([]);
+		await commands.get("context-hint")!("status", ctx);
+		expect(notifications.at(-1)?.level).toBe("info");
+		expect(notifications.at(-1)?.message).toContain("Context Hint enabled; model ");
+		expect(notifications.at(-1)?.message).toContain("Shortcut: Alt+O — expand/collapse cards");
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: collapsed");
+
+		const oldError = { ...pendingRecord(), generationId: "old-error", sessionId: "first", status: "error" as const, error: "old failure" };
+		await writeGeneration(paths, oldError);
+		entries.push({ type: "custom", customType: ENTRY_TYPE, data: { kind: "hint", generationId: oldError.generationId } });
+		await listeners.get("session_tree")!({}, ctx);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: error");
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+
+		const staleTimer = [...timers.values()][0];
+		sessionId = "second";
+		await listeners.get("session_start")!({ reason: "resume" }, ctx);
+		staleTimer.callback();
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: error");
+
+		const activePending = { ...pendingRecord(), generationId: "active-pending", sessionId: "second" };
+		await writeGeneration(paths, activePending);
+		entries.push({ type: "custom", customType: ENTRY_TYPE, data: { kind: "hint", generationId: activePending.generationId } });
+		await listeners.get("session_tree")!({}, ctx);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: generating");
+		expect([...timers.values()].map(({ delay }) => delay).sort((a, b) => a - b)).toEqual([80, 8_000]);
+
+		fireTimer(8_000);
+		expect(statuses.get("context-hint")).toContain("⠠⡤⠄ context-hint: generating");
+		expect(statuses.get("context-hint")).not.toContain(eyeGlyph("half"));
+		expect(statuses.get("context-hint")).not.toContain(eyeGlyph("open"));
+		expect([...timers.values()].map(({ delay }) => delay).sort((a, b) => a - b)).toEqual([80, 300]);
+		fireTimer(300);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: generating");
+		expect([...timers.values()].map(({ delay }) => delay).sort((a, b) => a - b)).toEqual([80, 8_000]);
+
+		await commands.get("context-hint")!("motion reduce", ctx);
+		expect(timers.size).toBe(0);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: generating");
+		await commands.get("context-hint")!("motion animate", ctx);
+		expect([...timers.values()].map(({ delay }) => delay).sort((a, b) => a - b)).toEqual([80, 8_000]);
+		await commands.get("context-hint")!("disable", ctx);
+		expect(timers.size).toBe(0);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: disabled");
+		await commands.get("context-hint")!("status", ctx);
+		expect(notifications.at(-1)?.message).toContain("Shortcut: Alt+O — expand/collapse cards");
+		expect(notifications.at(-1)?.message).toContain("Context Hint generation is disabled; existing cards can still be expanded or collapsed.");
+		const beforeEnableNotices = notifications.length;
+		await commands.get("context-hint")!("enable", ctx);
+		expect(notifications.slice(beforeEnableNotices)).toEqual([
+			{ message: "Context Hint enabled. Alt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
+		]);
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: error");
+
+		const readyRecord: GenerationRecord = {
+			...pendingRecord(),
+			generationId: "expanded-ready",
+			sessionId: "second",
+			status: "ready",
+			hint: emptyHint(),
+			sessionState: EMPTY_SESSION_STATE,
+			projectState: EMPTY_PROJECT_STATE,
+		};
+		await writeGeneration(paths, readyRecord);
+		entries.push({ type: "custom", customType: ENTRY_TYPE, data: { kind: "hint", generationId: readyRecord.generationId } });
+		await listeners.get("session_tree")!({}, ctx);
+		const expectStatusEye = (phase: "open" | "half" | "slit" | "closed") => {
+			expect(statuses.get("context-hint")!.startsWith(eyeGlyph(phase))).toBe(true);
+		};
+		const expectEyesMatch = (phase: "open" | "half" | "slit" | "closed") => {
+			expectStatusEye(phase);
+			const card = renderers.get(ENTRY_TYPE)!({ data: { kind: "hint", generationId: readyRecord.generationId } }, {}, theme);
+			expect(card.render(48)[0]).toContain(`${eyeGlyph(phase)} CONTEXT HINT`);
+		};
+		const beforeKeyboardToggleNotices = notifications.length;
+		await shortcuts.get("alt+o")!(ctx);
+		expectEyesMatch("closed");
+		for (const phase of ["slit", "half", "open", "open"] as const) {
+			fireTimer(80);
+			expectEyesMatch(phase);
+		}
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([5_000]);
+		fireTimer(5_000);
+		expectEyesMatch("open");
+		const staleBlink = [...timers.values()].find(({ delay, interval }) => delay === 80 && interval)!;
+		for (const phase of ["half", "slit", "closed", "slit", "half", "open", "open"] as const) {
+			fireTimer(80);
+			expectEyesMatch(phase);
+		}
+
+		await shortcuts.get("alt+o")!(ctx);
+		expectStatusEye("open");
+		for (const phase of ["half", "slit", "closed", "closed"] as const) {
+			fireTimer(80);
+			expectStatusEye(phase);
+		}
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+		sessionId = "third";
+		await listeners.get("session_start")!({ reason: "resume" }, ctx);
+		staleBlink.callback();
+		expectStatusEye("closed");
+		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
+		expect(notifications).toHaveLength(beforeKeyboardToggleNotices);
+
+		await shortcuts.get("alt+o")!(ctx);
+		await commands.get("context-hint")!("disable", ctx);
+		expect(timers.size).toBe(0);
+		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: disabled");
+		expectEyesMatch("closed");
+		await commands.get("context-hint")!("status", ctx);
+		expect(notifications.at(-1)?.message).toContain("Shortcut: Alt+O — expand/collapse cards");
+		expect(notifications.at(-1)?.message).toContain("Context Hint generation is disabled; existing cards can still be expanded or collapsed.");
+		const beforeCommandToggleNotices = notifications.length;
+		await commands.get("context-hint")!("toggle", ctx);
+		expect(notifications).toHaveLength(beforeCommandToggleNotices);
+		expectStatusEye("closed");
+		await commands.get("context-hint")!("toggle", ctx);
+		expect(notifications).toHaveLength(beforeCommandToggleNotices);
+		expectEyesMatch("closed");
+		await commands.get("context-hint")!("motion reduce", ctx);
+		expectEyesMatch("closed");
+		expect(timers.size).toBe(0);
+		await shortcuts.get("alt+o")!(ctx);
+		expectStatusEye("closed");
+		expect(timers.size).toBe(0);
+		await shortcuts.get("alt+o")!(ctx);
+		expectEyesMatch("closed");
+		expect(timers.size).toBe(0);
+		const beforeReducedEnableNotices = notifications.length;
+		await commands.get("context-hint")!("enable", ctx);
+		expect(notifications.slice(beforeReducedEnableNotices)).toEqual([
+			{ message: "Context Hint enabled. Alt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
+		]);
+		expectEyesMatch("open");
+		expect(timers.size).toBe(0);
+		const beforeReducedShortcutNotices = notifications.length;
+		await shortcuts.get("alt+o")!(ctx);
+		expectStatusEye("closed");
+		expect(notifications).toHaveLength(beforeReducedShortcutNotices);
+		expect(timers.size).toBe(0);
+
+		await listeners.get("session_shutdown")!({ reason: "exit" }, ctx);
+		expect(timers.size).toBe(0);
+		expect(statuses.has("context-hint")).toBe(false);
+	} finally {
+		Math.random = originalRandom;
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		await rm(temp, { recursive: true, force: true });
+	}
 });
 
 function emptyHint() {
