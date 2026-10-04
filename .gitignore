@@ -6,3 +6,5 @@ coverage/
 .env
 .env.*
 .pi/
+.wayfinder/
+skills-lock.json
