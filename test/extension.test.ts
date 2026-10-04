@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { TuiMainScreen, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONTEXT_HINT_SETTINGS,
@@ -548,7 +548,7 @@ test("one shared eye phase drives expanded card title and footer status", () => 
 	expect(status).toContain("⠔⣖⠢ context-hint: expanded");
 });
 
-test("footer eye stays synced across collapsed peeks, expanded blinks, and session cleanup", async () => {
+test("footer eye stays synced without repainting scrollback across peeks, blinks, and session cleanup", async () => {
 	const temp = await mkdtemp(join(tmpdir(), "context-hint-timers-"));
 	const agentDir = join(temp, "agent");
 	const cwd = join(temp, "project");
@@ -580,6 +580,19 @@ test("footer eye stays synced across collapsed peeks, expanded blinks, and sessi
 	const statuses = new Map<string, string>();
 	const notifications: Array<{ message: string; level: string }> = [];
 	const menuChoices: string[][] = [];
+	const terminalWrites: string[] = [];
+	const tui = new TuiMainScreen({
+		columns: 80,
+		rows: 24,
+		write: (data: string) => terminalWrites.push(data),
+		hideCursor() {},
+		showCursor() {},
+	} as any);
+	const originalRender = tui.render;
+	// Pi and extensions can load separate copies of pi-tui; avoid relying on instanceof.
+	const widgetTui = new Proxy(tui, { getPrototypeOf: () => Object.prototype });
+	expect(widgetTui instanceof TuiMainScreen).toBe(false);
+	let animationWidget: { dispose?(): void } | undefined;
 	const listeners = new Map<string, (event: any, ctx: any) => any>();
 	const commands = new Map<string, (args: string, ctx: any) => any>();
 	const shortcuts = new Map<string, (ctx: any) => any>();
@@ -600,6 +613,10 @@ test("footer eye stays synced across collapsed peeks, expanded blinks, and sessi
 		},
 		ui: {
 			theme,
+			setWidget: (_key: string, factory: ((tui: TuiMainScreen) => typeof animationWidget) | undefined) => {
+				animationWidget?.dispose?.();
+				animationWidget = factory?.(widgetTui);
+			},
 			notify: (message: string, level: string) => notifications.push({ message, level }),
 			select: async (_title: string, choices: string[]) => {
 				menuChoices.push(choices);
@@ -721,13 +738,41 @@ test("footer eye stays synced across collapsed peeks, expanded blinks, and sessi
 			expectEyesMatch(phase);
 		}
 		expect([...timers.values()].map(({ delay }) => delay)).toEqual([5_000]);
+		const cardTheme = { ...theme, fg: (_color: string, text: string) => `\x1b[31m${text}\x1b[39m` };
+		const historyCard = renderers.get(ENTRY_TYPE)!({ data: { kind: "hint", generationId: readyRecord.generationId } }, {}, cardTheme);
+		const visibleCard = renderers.get(ENTRY_TYPE)!({ data: { kind: "hint", generationId: readyRecord.generationId } }, {}, cardTheme);
+		tui.addChild(historyCard);
+		let historyText = "History line";
+		tui.addChild({ invalidate() {}, render: () => Array.from({ length: 40 }, (_, i) => `${historyText} ${i}`) });
+		tui.addChild(visibleCard);
+		let appendedLine = "";
+		tui.addChild({ invalidate() {}, render: () => appendedLine ? [appendedLine] : [] });
+		tui.addChild({ invalidate() {}, render: () => [statuses.get("context-hint")!] });
+		tui.renderNow();
+		const historyTitle = tui.captureRenderState().previousLines[0];
+		const visibleTitleRow = historyCard.render(80).length + 40;
+		expect(visibleTitleRow).toBeGreaterThanOrEqual(tui.captureRenderState().previousViewportTop);
+		const redrawsBeforeBlink = tui.fullRedraws;
+		terminalWrites.length = 0;
 		fireTimer(5_000);
 		expectEyesMatch("open");
 		const staleBlink = [...timers.values()].find(({ delay, interval }) => delay === 80 && interval)!;
 		for (const phase of ["half", "slit", "closed", "slit", "half", "open", "open"] as const) {
 			fireTimer(80);
 			expectEyesMatch(phase);
+			if (phase === "closed") appendedLine = "New streamed output";
+			tui.renderNow();
+			expect(tui.fullRedraws).toBe(redrawsBeforeBlink);
+			expect(terminalWrites.join("")).not.toContain("\x1b[3J");
+			expect(tui.captureRenderState().previousLines[0]).toBe(historyTitle);
+			expect(stripTerminalSequences(tui.captureRenderState().previousLines[visibleTitleRow])).toContain(`${eyeGlyph(phase)} CONTEXT HINT`);
 		}
+
+		expect(tui.captureRenderState().previousLines.some((line) => line.includes("New streamed output"))).toBe(true);
+		historyText = "Updated history";
+		tui.renderNow();
+		expect(tui.captureRenderState().previousLines.some((line) => line.includes("Updated history"))).toBe(true);
+		expect(tui.fullRedraws).toBeGreaterThan(redrawsBeforeBlink);
 
 		await shortcuts.get("alt+o")!(ctx);
 		expectStatusEye("open");
@@ -745,6 +790,8 @@ test("footer eye stays synced across collapsed peeks, expanded blinks, and sessi
 
 		await shortcuts.get("alt+o")!(ctx);
 		await commands.get("context-hint")!("disable", ctx);
+		tui.renderNow();
+		expect(stripTerminalSequences(tui.captureRenderState().previousLines[0])).toContain(`${eyeGlyph("closed")} CONTEXT HINT`);
 		expect(timers.size).toBe(0);
 		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: disabled");
 		expectEyesMatch("closed");
@@ -781,6 +828,7 @@ test("footer eye stays synced across collapsed peeks, expanded blinks, and sessi
 		expect(timers.size).toBe(0);
 
 		await listeners.get("session_shutdown")!({ reason: "exit" }, ctx);
+		expect(tui.render).toBe(originalRender);
 		expect(timers.size).toBe(0);
 		expect(statuses.has("context-hint")).toBe(false);
 	} finally {

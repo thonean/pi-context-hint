@@ -9,7 +9,7 @@ import {
 	type Theme,
 	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
-import { type AutocompleteItem, type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AutocompleteItem, type Component, type TuiMainScreen, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONTEXT_HINT_SETTINGS,
@@ -54,6 +54,7 @@ import {
 } from "../src/core";
 
 const STATUS_KEY = "context-hint";
+const ANIMATION_WIDGET_KEY = "context-hint-animation";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
 const EYE_FRAME_INTERVAL_MS = 80;
@@ -261,8 +262,10 @@ export default function (pi: ExtensionAPI) {
 	let eyeTimer: ReturnType<typeof setTimeout> | undefined;
 	let eyeAnimationTimer: ReturnType<typeof setInterval> | undefined;
 	let eyePeekTimer: ReturnType<typeof setTimeout> | undefined;
+	let animationOnlyRender = false;
 
-	function pulse(ctx: ExtensionContext): void {
+	function pulse(ctx: ExtensionContext, animationOnly = false): void {
+		animationOnlyRender = animationOnly;
 		if (!ctx.hasUI) return;
 		if (closed) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -299,6 +302,38 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		clearAnimationTimers();
 		closed = false;
+		if (ctx.mode === "tui") {
+			ctx.ui.setWidget(ANIMATION_WIDGET_KEY, (tui) => {
+				const widget = { invalidate() {}, render: () => [] as string[], dispose() {} };
+				const screen = tui as TuiMainScreen;
+				if (tui.mode !== "regular" || typeof screen.captureRenderState !== "function") return widget;
+				const render = tui.render;
+				const guardedRender = (width: number) => {
+					const lines = render.call(tui, width);
+					if (!animationOnlyRender) return lines;
+					const state = screen.captureRenderState();
+					if (state.previousWidth !== width || state.previousHeight !== tui.terminal.rows) return lines;
+					// Editing a title in terminal scrollback forces Pi to clear and repaint it.
+					// Keep offscreen eye frames; visible cards and real content changes still render.
+					const historyEnd = Math.min(state.previousViewportTop, state.previousLines.length, lines.length);
+					for (let row = 0; row < historyEnd; row++) {
+						if (!/^┏━* [\u2800-\u28ff]/.test(stripTerminalSequences(lines[row]))) continue;
+						const previous = state.previousLines[row].replace(/[\u2800-\u28ff]/g, "");
+						const current = lines[row].replace(/[\u2800-\u28ff]/g, "");
+						const suffix = previous.slice(current.length);
+						if (previous.startsWith(current) && stripTerminalSequences(suffix) === "") {
+							lines[row] = state.previousLines[row].slice(0, state.previousLines[row].length - suffix.length);
+						}
+					}
+					return lines;
+				};
+				tui.render = guardedRender;
+				widget.dispose = () => {
+					if (tui.render === guardedRender) tui.render = render;
+				};
+				return widget;
+			});
+		}
 		activeSessionId = ctx.sessionManager.getSessionId();
 		settings = await readContextHintSettings(getAgentDir());
 		eyePhase = settings.expanded ? "open" : "closed";
@@ -389,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await cancelPending(`Generation interrupted by session ${event.reason}.`, ctx);
 		} finally {
+			if (ctx.mode === "tui") ctx.ui.setWidget(ANIMATION_WIDGET_KEY, undefined);
 			pulse(ctx);
 		}
 	});
@@ -674,14 +710,14 @@ export default function (pi: ExtensionAPI) {
 			eyeTimer = undefined;
 			if (settings.expanded || !config.enabled || settings.motion === "reduce") return;
 			eyePhase = "slit";
-			pulse(ctx);
+			pulse(ctx, true);
 			let peekTimer: ReturnType<typeof setTimeout>;
 			peekTimer = setTimeout(() => {
 				if (eyePeekTimer !== peekTimer || generation !== eyeTimerGeneration || sessionId !== activeSessionId || closed) return;
 				eyePeekTimer = undefined;
 				if (settings.expanded || !config.enabled || settings.motion === "reduce") return;
 				eyePhase = "closed";
-				pulse(ctx);
+				pulse(ctx, true);
 				scheduleCollapsedPeek(ctx);
 			}, PEEK_DURATION_MS);
 			eyePeekTimer = peekTimer;
@@ -695,7 +731,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = activeSessionId;
 		let index = 0;
 		eyePhase = frames[index];
-		pulse(ctx);
+		pulse(ctx, true);
 		let timer: ReturnType<typeof setInterval>;
 		timer = setInterval(() => {
 			if (eyeAnimationTimer !== timer || generation !== eyeTimerGeneration || sessionId !== activeSessionId || closed) return;
@@ -710,12 +746,12 @@ export default function (pi: ExtensionAPI) {
 				if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
 				eyeAnimationTimer = undefined;
 				eyePhase = "open";
-				pulse(ctx);
+				pulse(ctx, true);
 				done();
 				return;
 			}
 			eyePhase = frames[index];
-			pulse(ctx);
+			pulse(ctx, true);
 		}, EYE_FRAME_INTERVAL_MS);
 		eyeAnimationTimer = timer;
 	}
@@ -747,12 +783,12 @@ export default function (pi: ExtensionAPI) {
 				if (eyeAnimationTimer) clearInterval(eyeAnimationTimer);
 				eyeAnimationTimer = undefined;
 				eyePhase = nextExpanded ? "open" : "closed";
-				pulse(ctx);
+				pulse(ctx, true);
 				syncEyeAnimation(ctx);
 				return;
 			}
 			eyePhase = frames[index];
-			pulse(ctx);
+			pulse(ctx, true);
 		}, EYE_FRAME_INTERVAL_MS);
 		eyeAnimationTimer = timer;
 	}
