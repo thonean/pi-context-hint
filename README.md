@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/context-hint-logo.svg" alt="Context Hint pixel eye logo" width="120"></p>
+<p align="center"><img src="https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-logo.svg" alt="Context Hint pixel eye logo" width="120"></p>
 
 <h1 align="center">Context Hint for Pi</h1>
 
@@ -14,7 +14,7 @@ Context Hint helps when you switch between projects, worktrees, and Pi sessions.
 
 ## Demo
 
-![Animated preview of a fictional Context Hint card](assets/context-hint-demo.gif)
+![Animated preview of a fictional Context Hint card](https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif)
 
 The GIF is silent, 720 × 1,280, and 18 seconds long. It uses fictional project details and does not show a real screen recording.
 
