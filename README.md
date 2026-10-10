@@ -2,35 +2,39 @@
 
 <h1 align="center">Context Hint for Pi</h1>
 
-**Pick up a Pi session without rereading its transcript.** Context Hint adds a compact Project / Session / Turn card after a settled interaction, surfacing the project's purpose, session goal, recent change, and a possible next step.
+<p align="center">
+  <a href="https://www.npmjs.com/package/pi-context-hint"><img src="https://img.shields.io/npm/v/pi-context-hint?logo=npm" alt="npm version"></a>
+  <a href="https://cdn.jsdelivr.net/npm/pi-context-hint/LICENSE"><img src="https://img.shields.io/npm/l/pi-context-hint" alt="MIT license"></a>
+  <a href="https://pi.dev/packages/pi-context-hint"><img src="https://img.shields.io/badge/Pi-extension-7c3aed" alt="Pi extension"></a>
+</p>
 
-I built it after switching between projects, worktrees, and agent sessions left me spending too long reconstructing what I had left behind.
+**Pick up a Pi session without rereading its transcript.** Context Hint adds a compact Project, Session, and Turn card after each settled interaction. The card shows the project's purpose, session goal, recent change, and possible next step.
+
+Context Hint helps when you switch between projects, worktrees, and Pi sessions. Read the latest card instead of reconstructing the previous session from its transcript.
 
 ## Demo
 
-[![Static preview of a fictional Context Hint card](assets/context-hint-still.png)](assets/context-hint-demo.mp4)
+![Animated preview of a fictional Context Hint card](assets/context-hint-demo.gif)
 
-[Watch the 18-second demo with sound](assets/context-hint-demo.mp4) (18 seconds, about 32 MB; depending on your browser, it may play or download).
-
-*The demo uses fictional project details; it is illustrative, not an actual screen recording. [Open the static still](assets/context-hint-still.png) independently.*
+The GIF is silent, 720 × 1,280, and 18 seconds long. It uses fictional project details and does not show a real screen recording.
 
 ## A typical switch
 
 Imagine an API fix in one worktree and a UI change in another. Leave the API session while work continues, switch to the UI, then return. Instead of reconstructing the API thread from earlier messages, read its last Context Hint card to see what changed and what might come next.
 
-The card is a **human-facing recovery cue**, not a cross-session dashboard: it does not monitor other agents or alert you when they finish. It appears in each enabled Pi session after an interaction settles. Earlier cards remain in that session's transcript; `alt+o` expands or collapses them.
+The card is a **human-facing recovery cue**. It does not monitor other agents or alert you when they finish. It appears in each enabled Pi session after an interaction settles. Earlier cards remain in that session's transcript. Press `alt+o` to expand or collapse them.
 
 ## Try it
 
-Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. With Pi and Bun installed, run it from a local checkout today:
+Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. Install the published package with Pi:
 
 ```bash
-bun install
-bun run build
-pi -e ./dist/context-hint.js
+pi install npm:pi-context-hint
 ```
 
-Generation starts **disabled**. Enabling it sends selected interaction evidence and previous Project / Session state to a summary model after each settled turn, normally in one extra request. [See model use, cost, and privacy details](#model-use-token-cost-and-context). In Pi, run:
+In an existing Pi session, run `/reload` after installation. Bun is only needed when you run the extension from a local checkout.
+
+Generation starts **disabled**. Enabling it sends selected interaction evidence and previous Project / Session state to a summary model after each settled turn, normally in one extra request. [See model use, token cost, and context](#model-use-token-cost-and-context). In Pi, run:
 
 ```text
 /context-hint enable
@@ -38,10 +42,12 @@ Generation starts **disabled**. Enabling it sends selected interaction evidence 
 
 Continue working normally. After the next settled interaction, a Context Hint card appears. Use `/context-hint model` if you want a dedicated summary model instead of Pi's current model.
 
-The package is private and **not published yet**. Keep this placeholder command for when a package name is assigned:
+To run it from a local checkout during development:
 
 ```bash
-pi install npm:@your-scope/pi-context-hint
+bun install
+bun run build
+pi -e ./dist/context-hint.js
 ```
 
 ## What the three layers mean
@@ -52,7 +58,7 @@ pi install npm:@your-scope/pi-context-hint
 | **Session** | Current goal, focus, blockers, and next steps | Follows the active Pi session branch; forks and clones inherit a snapshot, then diverge |
 | **Turn** | What was accomplished or learned in the settled interaction | Shown in that interaction's card |
 
-A new Pi session starts without the previous session's rolling Session Context; Project Context remains available for that repository. Different repositories have separate Project Context. Turn summaries use selected evidence from the current interaction, not a replay of the full conversation.
+A new Pi session starts without the previous session's rolling Session Context. Project Context remains available for that repository. Different repositories have separate Project Context. Turn summaries use selected evidence from the current interaction, not a replay of the full conversation.
 
 ## Commands
 
@@ -60,11 +66,11 @@ A new Pi session starts without the previous session's rolling Session Context; 
 | --- | --- |
 | `/context-hint` | Open the command menu |
 | `/context-hint status` | Show current configuration |
-| `/context-hint enable` / `disable` | Start or stop future generation; disabling keeps existing state |
+| `/context-hint enable` or `/context-hint disable` | Start or stop future generation. Disabling keeps existing state. |
 | `/context-hint model` | Choose the summary model or inherit Pi's current model |
 | `/context-hint regenerate` | Regenerate the latest settled hint |
 | `/context-hint toggle` or `alt+o` | Expand or collapse cards |
-| `/context-hint motion reduce` / `motion animate` | Disable or enable spinner and eye animation |
+| `/context-hint motion reduce` or `/context-hint motion animate` | Disable or enable spinner and eye animation |
 | `/context-hint reset-session` | Reset rolling Session Context |
 | `/context-hint reset-project` | Reset durable Project Context for this project |
 
@@ -76,7 +82,7 @@ A new Pi session starts without the previous session's rolling Session Context; 
 
 For a rough English-language illustration: if the *assembled* prompt for one turn is about 8,000 characters, it might be around 2,000 input tokens, plus system instructions and tool schema; a short result might use a few hundred output tokens. A near-20,000-character prompt might instead be on the order of 5,000 English input tokens before that overhead. Code, non-English text, model tokenizers, and a possible second repair request change the numbers. Context Hint does not record token usage or cost, so these examples are **not measured usage or a price estimate**. Your provider's usage data is the source for actual cost.
 
-Cards are custom transcript entries for **you**: their rendered text is not automatically inserted into ordinary later agent prompts. Summary generation is different: it sends the previous Project / Session state and selected current-turn evidence to the chosen model so it can update the card. Context Hint therefore avoids replaying entire transcripts into ordinary future model context, but it still consumes tokens and shares data with the summary model on each generation.
+Cards are custom transcript entries for **you**. Their rendered text is not automatically inserted into ordinary later agent prompts. Summary generation sends the previous Project and Session state and selected current-turn evidence to the chosen model so it can update the card. Context Hint avoids replaying entire transcripts into ordinary future model context. It still consumes tokens and shares data with the summary model on each generation.
 
 ## Data and privacy
 
@@ -93,7 +99,7 @@ Before sending a prompt to the chosen model, Context Hint applies pattern-based 
 
 ## Contributing
 
-Development setup, tests, type checking, build, packaging, and the manual Pi smoke checklist live in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+Development setup, tests, type checking, build, packaging, and the manual Pi smoke checklist live in the [repository's contribution guide](https://github.com/thonean/pi-context-hint/blob/main/CONTRIBUTING.md). You need repository access while the source repository is private.
 
 ## License
 

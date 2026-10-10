@@ -4,7 +4,7 @@
 
 - Bun 1.3.13 or newer
 - Node 22.19 or newer
-- npm (used only for tarball checks)
+- npm for package checks and publishing
 - Pi for manual package smoke testing
 
 ## Setup
@@ -37,11 +37,13 @@ bun run check
 
 `bun run package:smoke` builds a real npm tarball, checks its exact allowlist, installs it in a temporary directory without dev dependencies, and verifies the installed Pi manifest target.
 
-`bun run release:check` reruns the full repository checks, then performs the strict tarball checks and rejects the current placeholder package identity or `private: true`. It is expected to fail until publication metadata is deliberately replaced.
+`bun run release:check` reruns the full repository checks, then performs the strict tarball checks. It rejects placeholder publication metadata and `private: true`.
+
+The npm package includes the extension, README, license, logo, static preview, and animated GIF. MP4 files stay out of the package.
 
 ## Manual Pi smoke test
 
-After package identity is ready for publication:
+Before publishing a new version:
 
 1. Run `bun run release:check`.
 2. Install the packed artifact into a disposable Pi environment.
@@ -58,15 +60,27 @@ Do not add model credentials to CI. Real model interaction belongs in this local
 
 ## Before publishing
 
-Replace every placeholder and review the packed tarball before removing the publication guard:
+Review publication metadata and the packed tarball:
 
-- `name`: replace `@your-scope/pi-context-hint`
-- `repository.url`, `homepage`, and `bugs.url`: replace `your-org/pi-context-hint`
-- `author`: replace `YOUR_NAME`
-- `version`: replace `0.0.0-development`
-- `private`: change `true` only when publication is intentional
-- Confirm MIT license and final README install command
-- Run `bun run release:check`
-- Complete manual Pi smoke test
+- Keep the package name `pi-context-hint`.
+- Confirm repository, homepage, author, and issue URLs.
+- Choose a version that has not been published to npm.
+- Update the versioned CDN preview URL in `pi.image`.
+- Keep `private` unset or `false` for intentional public releases.
+- Confirm the MIT license and `pi install npm:pi-context-hint` command.
+- Run `bun run release:check`.
+- Complete the manual Pi smoke test.
 
 Do not publish from an unreviewed working tree.
+
+## Regenerate the README demo
+
+Use the current demo at `assets/context-hint-demo.mp4`. This command preserves its full 18-second duration and portrait aspect ratio, producing a silent 720 × 1,280 GIF:
+
+```bash
+ffmpeg -y -i assets/context-hint-demo.mp4 \
+  -filter_complex "[0:v]fps=6,scale=720:1280:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:reserve_transparent=0[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5" \
+  -loop 0 assets/context-hint-demo.gif
+```
+
+Keep the GIF in the npm file allowlist so the published README can reference it.
