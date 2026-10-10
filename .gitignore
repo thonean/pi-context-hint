@@ -8,3 +8,8 @@ coverage/
 .pi/
 .wayfinder/
 skills-lock.json
+/assets/logo-exploration/
+/assets/context-hint-demo.gif
+/assets/context-hint-demo-v*.mp4
+/assets/previous-context-hint-demo.mp4
+/video/

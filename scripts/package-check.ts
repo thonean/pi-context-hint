@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 export const EXPECTED_TARBALL_ENTRIES = [
 	"package/LICENSE",
 	"package/README.md",
+	"package/assets/context-hint-logo.svg",
+	"package/assets/context-hint-still.png",
 	"package/dist/context-hint.js",
 	"package/package.json",
 ];
@@ -26,8 +28,8 @@ interface PackageManifest {
 
 export function validatePackageMetadata(manifest: PackageManifest, release = false): string[] {
 	const errors: string[] = [];
-	if (manifest.files?.slice().sort().join("\n") !== ["LICENSE", "README.md", "dist/context-hint.js"].join("\n")) {
-		errors.push('package.json files must be exactly ["dist/context-hint.js", "README.md", "LICENSE"]');
+	if (manifest.files?.slice().sort().join("\n") !== ["LICENSE", "README.md", "assets/context-hint-logo.svg", "assets/context-hint-still.png", "dist/context-hint.js"].join("\n")) {
+		errors.push('package.json files must list the extension, README, license, and two README assets');
 	}
 	if (manifest.pi?.extensions?.length !== 1 || manifest.pi.extensions[0] !== "dist/context-hint.js") {
 		errors.push('package.json pi.extensions must point to "dist/context-hint.js"');

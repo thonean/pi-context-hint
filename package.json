@@ -23,7 +23,9 @@
   "files": [
     "dist/context-hint.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "assets/context-hint-logo.svg",
+    "assets/context-hint-still.png"
   ],
   "pi": {
     "extensions": [

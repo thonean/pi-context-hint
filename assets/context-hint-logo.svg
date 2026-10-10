@@ -1,0 +1,40 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc" shape-rendering="crispEdges"><title id="title">Context Hint — P2 white eye on black circle</title><desc id="desc">Original P2 pixel blocks uniformly scaled by 0.82, upright, on a black pixel circle. Background constructed on a 24x24 grid of 20px cells, with only horizontal/vertical edges. No border or filters. Transparent outside the background shape.</desc><g id="pixel-background" fill="#000000"><rect x="196" y="16" width="120" height="20" /><rect x="136" y="36" width="240" height="20" /><rect x="116" y="56" width="280" height="20" /><rect x="96" y="76" width="320" height="20" /><rect x="76" y="96" width="360" height="20" /><rect x="56" y="116" width="400" height="20" /><rect x="36" y="136" width="440" height="20" /><rect x="36" y="156" width="440" height="20" /><rect x="36" y="176" width="440" height="20" /><rect x="16" y="196" width="480" height="20" /><rect x="16" y="216" width="480" height="20" /><rect x="16" y="236" width="480" height="20" /><rect x="16" y="256" width="480" height="20" /><rect x="16" y="276" width="480" height="20" /><rect x="16" y="296" width="480" height="20" /><rect x="36" y="316" width="440" height="20" /><rect x="36" y="336" width="440" height="20" /><rect x="36" y="356" width="440" height="20" /><rect x="56" y="376" width="400" height="20" /><rect x="76" y="396" width="360" height="20" /><rect x="96" y="416" width="320" height="20" /><rect x="116" y="436" width="280" height="20" /><rect x="136" y="456" width="240" height="20" /><rect x="196" y="476" width="120" height="20" /></g><g fill="#FFFFFF" transform="translate(256 256) scale(0.82) translate(-256 -256)">
+    <rect x="196" y="148" width="108" height="12" />
+    <rect x="160" y="160" width="168" height="12" />
+    <rect x="148" y="172" width="192" height="12" />
+    <rect x="124" y="184" width="240" height="12" />
+    <rect x="112" y="196" width="36" height="12" />
+    <rect x="280" y="196" width="96" height="12" />
+    <rect x="100" y="208" width="24" height="12" />
+    <rect x="244" y="208" width="36" height="12" />
+    <rect x="316" y="208" width="72" height="12" />
+    <rect x="88" y="220" width="12" height="12" />
+    <rect x="244" y="220" width="48" height="12" />
+    <rect x="340" y="220" width="60" height="12" />
+    <rect x="244" y="232" width="48" height="12" />
+    <rect x="364" y="232" width="48" height="12" />
+    <rect x="88" y="244" width="24" height="12" />
+    <rect x="232" y="244" width="72" height="12" />
+    <rect x="388" y="244" width="36" height="12" />
+    <rect x="76" y="256" width="36" height="12" />
+    <rect x="220" y="256" width="84" height="12" />
+    <rect x="76" y="268" width="36" height="12" />
+    <rect x="196" y="268" width="108" height="12" />
+    <rect x="400" y="268" width="12" height="12" />
+    <rect x="88" y="280" width="24" height="12" />
+    <rect x="196" y="280" width="108" height="12" />
+    <rect x="376" y="280" width="24" height="12" />
+    <rect x="112" y="292" width="12" height="12" />
+    <rect x="208" y="292" width="84" height="12" />
+    <rect x="364" y="292" width="24" height="12" />
+    <rect x="124" y="304" width="12" height="12" />
+    <rect x="220" y="304" width="60" height="12" />
+    <rect x="328" y="304" width="48" height="12" />
+    <rect x="160" y="316" width="12" height="12" />
+    <rect x="304" y="316" width="60" height="12" />
+    <rect x="172" y="328" width="180" height="12" />
+    <rect x="184" y="340" width="144" height="12" />
+    <rect x="208" y="352" width="96" height="12" />
+  </g>
+</svg>

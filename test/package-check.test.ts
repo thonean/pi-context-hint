@@ -10,7 +10,7 @@ const manifest = {
 	repository: { type: "git", url: "git+https://github.com/your-org/pi-context-hint.git" },
 	homepage: "https://github.com/your-org/pi-context-hint#readme",
 	bugs: { url: "https://github.com/your-org/pi-context-hint/issues" },
-	files: ["dist/context-hint.js", "README.md", "LICENSE"],
+	files: ["dist/context-hint.js", "README.md", "LICENSE", "assets/context-hint-logo.svg", "assets/context-hint-still.png"],
 	pi: { extensions: ["dist/context-hint.js"] },
 };
 
@@ -32,6 +32,19 @@ test("tarball allowlist rejects both omitted and unexpected entries", () => {
 	expect(validateTarballEntries(["package/package.json", "package/dist/context-hint.js", "package/debug.log"])).toEqual([
 		"tarball is missing package/LICENSE",
 		"tarball is missing package/README.md",
+		"tarball is missing package/assets/context-hint-logo.svg",
+		"tarball is missing package/assets/context-hint-still.png",
 		"tarball contains unexpected package/debug.log",
+	]);
+});
+
+test("tarball rejects repository-only demo GIF and MP4", () => {
+	expect(validateTarballEntries([
+		...EXPECTED_TARBALL_ENTRIES,
+		"package/assets/context-hint-demo.gif",
+		"package/assets/context-hint-demo.mp4",
+	])).toEqual([
+		"tarball contains unexpected package/assets/context-hint-demo.gif",
+		"tarball contains unexpected package/assets/context-hint-demo.mp4",
 	]);
 });
