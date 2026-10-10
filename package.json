@@ -1,7 +1,6 @@
 {
-  "name": "@your-scope/pi-context-hint",
-  "version": "0.0.0-development",
-  "private": true,
+  "name": "pi-context-hint",
+  "version": "0.1.1",
   "description": "Persistent Project, Session, and Turn context cards for the Pi coding agent.",
   "keywords": [
     "pi-package",
@@ -11,13 +10,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-org/pi-context-hint.git"
+    "url": "git+https://github.com/thonean/pi-context-hint.git"
   },
-  "homepage": "https://github.com/your-org/pi-context-hint#readme",
+  "homepage": "https://github.com/thonean/pi-context-hint#readme",
   "bugs": {
-    "url": "https://github.com/your-org/pi-context-hint/issues"
+    "url": "https://github.com/thonean/pi-context-hint/issues"
   },
-  "author": "YOUR_NAME",
+  "author": "thonean",
   "license": "MIT",
   "type": "module",
   "files": [
@@ -25,9 +24,11 @@
     "README.md",
     "LICENSE",
     "assets/context-hint-logo.svg",
-    "assets/context-hint-still.png"
+    "assets/context-hint-still.png",
+    "assets/context-hint-demo.gif"
   ],
   "pi": {
+    "image": "https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-still.png",
     "extensions": [
       "dist/context-hint.js"
     ]
