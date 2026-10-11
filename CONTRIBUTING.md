@@ -39,7 +39,7 @@ bun run check
 
 `bun run release:check` reruns the full repository checks, then performs the strict tarball checks. It rejects placeholder publication metadata and `private: true`.
 
-The npm package includes the extension, README, license, logo, static preview, and animated GIF. MP4 files stay out of the package.
+Tarballs built from this checkout include the extension, README, license, logo, and static preview. They exclude demo MP4 and GIF files. The already-published `0.1.1` package still contains the original GIF and cannot be changed. The README GIF loads from that version-pinned [`pi-context-hint@0.1.1` jsDelivr asset](https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif). Replacing the online GIF needs a new public asset URL. Keep the README URL unchanged until that asset is deployed.
 
 ## Manual Pi smoke test
 
@@ -73,14 +73,14 @@ Review publication metadata and the packed tarball:
 
 Do not publish from an unreviewed working tree.
 
-## Regenerate the README demo
+## Regenerate the repository GIF
 
-Use the current demo at `assets/context-hint-demo.mp4`. This command preserves its full 18-second duration and portrait aspect ratio, producing a silent 720 × 1,280 GIF:
+Run this command from the repository root to rebuild the repository GIF from `assets/context-hint-demo.mp4`. It preserves the full 18-second duration and portrait ratio at 720 × 1,280:
 
 ```bash
-ffmpeg -y -i assets/context-hint-demo.mp4 \
+ffmpeg -y -hide_banner -loglevel error -i assets/context-hint-demo.mp4 \
   -filter_complex "[0:v]fps=6,scale=720:1280:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:reserve_transparent=0[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5" \
   -loop 0 assets/context-hint-demo.gif
 ```
 
-Keep the GIF in the npm file allowlist so the published README can reference it.
+Keep video and GIF media in the repository for source previews. Do not add them to the npm file allowlist.

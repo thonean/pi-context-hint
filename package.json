@@ -24,8 +24,7 @@
     "README.md",
     "LICENSE",
     "assets/context-hint-logo.svg",
-    "assets/context-hint-still.png",
-    "assets/context-hint-demo.gif"
+    "assets/context-hint-still.png"
   ],
   "pi": {
     "image": "https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-still.png",

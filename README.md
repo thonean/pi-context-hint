@@ -14,9 +14,9 @@ Context Hint helps when you switch between projects, worktrees, and Pi sessions.
 
 ## Demo
 
-![Animated preview of a fictional Context Hint card](https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif)
-
-The GIF is silent, 720 × 1,280, and 18 seconds long. It uses fictional project details and does not show a real screen recording.
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif" alt="Animated preview of a fictional Context Hint card" width="320">
+</p>
 
 ## A typical switch
 
