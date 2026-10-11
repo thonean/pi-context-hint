@@ -39,7 +39,7 @@ bun run check
 
 `bun run release:check` reruns the full repository checks, then performs the strict tarball checks. It rejects placeholder publication metadata and `private: true`.
 
-Tarballs built from this checkout include the extension, README, license, logo, and static preview. They exclude demo MP4 and GIF files. The already-published `0.1.1` package still contains the original GIF and cannot be changed. The README GIF loads from that version-pinned [`pi-context-hint@0.1.1` jsDelivr asset](https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif). Replacing the online GIF needs a new public asset URL. Keep the README URL unchanged until that asset is deployed.
+Tarballs built from this checkout include the extension, README, license, logo, and static preview. They exclude demo MP4 and GIF files. The published package excludes demo MP4 and GIF files. The README GIF loads from the separate public [`pi-context-hint-media` repository](https://github.com/thonean/pi-context-hint-media). Keep demo media outside the npm file allowlist.
 
 ## Manual Pi smoke test
 
