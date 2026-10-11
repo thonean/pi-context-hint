@@ -15,7 +15,7 @@ Context Hint helps when you switch between projects, worktrees, and Pi sessions.
 ## Demo
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.1/assets/context-hint-demo.gif" alt="Animated preview of a fictional Context Hint card" width="320">
+  <img src="https://github.com/thonean/pi-context-hint-media/raw/main/context-hint-demo-cropped.gif" alt="Animated preview of a fictional Context Hint card" width="240">
 </p>
 
 ## A typical switch
