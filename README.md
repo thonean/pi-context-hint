@@ -26,7 +26,7 @@ The card is a **human-facing recovery cue**. It does not monitor other agents or
 
 ## Try it
 
-Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. Install the published package with Pi:
+Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. It requires Pi 1.1.0 or later. Install the published package with Pi:
 
 ```bash
 pi install npm:pi-context-hint
@@ -67,7 +67,7 @@ A new Pi session starts without the previous session's rolling Session Context. 
 | `/context-hint` | Open the command menu |
 | `/context-hint status` | Show current configuration |
 | `/context-hint enable` or `/context-hint disable` | Start or stop future generation. Disabling keeps existing state. |
-| `/context-hint model` | Choose the summary model or inherit Pi's current model |
+| `/context-hint model` | Choose a summary model and adjust its independent thinking level, or inherit Pi's current model |
 | `/context-hint regenerate` | Regenerate the latest settled hint |
 | `/context-hint toggle` or `alt+o` | Expand or collapse cards |
 | `/context-hint motion reduce` or `/context-hint motion animate` | Disable or enable spinner and eye animation |
@@ -76,7 +76,7 @@ A new Pi session starts without the previous session's rolling Session Context. 
 
 ## Model use, token cost, and context
 
-**This uses an extra model request, not free local summarization.** When enabled in a Pi TUI, a settled interaction normally makes one request to the selected summary model. If its response fails validation, Context Hint can make one repair request to the same model. Manual regeneration also requests a new summary. By default the extension inherits Pi's current model; use `/context-hint model` to select an available, lower-cost model if that suits your summaries. There is no automatic fallback to another model.
+**This uses an extra model request, not free local summarization.** When enabled in a Pi TUI, a settled interaction normally makes one request to the selected summary model. If its response fails validation, Context Hint can make one repair request to the same model. Both requests use the summary model's configured thinking level. Manual regeneration also requests a new summary. By default the extension inherits Pi's current model, but not Pi's thinking level: summary thinking defaults to `off` when supported, otherwise the model's lowest supported level. Use `/context-hint model` to select an available, lower-cost model or independently adjust its thinking level with ←/→; ↑/↓ changes model, Enter saves, and Esc discards changes. Models without thinking support show that status instead of a slider. Pi model metadata determines which thinking levels the picker lists; Context Hint does not test provider API support. Levels are persisted per project and `provider/model`, and only supported levels are shown. If a saved level becomes unsupported, the picker warns and shows the highest supported level at or below it, or the lowest supported level if none is lower; fallback is saved only on Enter. There is no automatic fallback to another model.
 
 **Input is selected and truncated, not the full transcript.** Evidence can include up to 4,000 characters of the current user prompt, 6,000 combined characters of assistant text, the first 24 tool facts (each with truncated input and text output), and short excerpts of `CONTEXT.md`, `README.md`, and `package.json` when present. Previous Project and Session state is also included. The serialized generation prompt is truncated to 20,000 JavaScript string units; the validation-repair request adds instructions. Each request sets `maxTokens: 3,500` for output. These are character/item limits on input and a requested output-token limit, **not a strict input-token or billing ceiling**.
 

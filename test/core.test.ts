@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	DEFAULT_CONFIG,
 	DEFAULT_CONTEXT_HINT_SETTINGS,
 	EMPTY_SESSION_STATE,
 	codeCuePaths,
@@ -12,6 +13,7 @@ import {
 	latestGenerationRecord,
 	normalizeCodeCueEvidence,
 	projectPaths,
+	readConfig,
 	readContextHintSettings,
 	readProjectDocument,
 	redactAndTruncate,
@@ -19,6 +21,7 @@ import {
 	restoreSessionState,
 	updateProjectDocument,
 	validateCodeCues,
+	writeConfig,
 	writeContextHintSettings,
 	type GenerationRecord,
 	type ProjectState,
@@ -94,6 +97,29 @@ describe("project persistence", () => {
 		const stale = await updateProjectDocument(paths, "git:/project/.git", "/project/a", 0, { summary: "stale" });
 		expect(stale.epoch).toBe(reset.epoch);
 		expect(stale.state.summary).toBe("");
+	});
+});
+
+describe("summary model configuration", () => {
+	test("reads legacy configuration and persists thinking memory per project", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "context-hint-model-config-"));
+		temporaryDirectories.push(agentDir);
+		const first = projectPaths(agentDir, "git:/project/first");
+		const second = projectPaths(agentDir, "git:/project/second");
+		await mkdir(first.dir, { recursive: true });
+		await writeFile(first.config, JSON.stringify({ schemaVersion: 1, enabled: true, model: { mode: "inherit" } }));
+
+		expect(await readConfig(first)).toEqual({ schemaVersion: 1, enabled: true, model: { mode: "inherit" } });
+		expect(await readConfig(second)).toEqual({ schemaVersion: 1, enabled: false, model: { mode: "inherit" } });
+
+		const config = {
+			...DEFAULT_CONFIG,
+			model: { mode: "explicit" as const, provider: "openai", id: "reasoning/model" },
+			thinkingLevels: { "openai/reasoning/model": "xhigh" as const },
+		};
+		await writeConfig(first, config);
+		expect(await readConfig(first)).toEqual(config);
+		expect(await readConfig(second)).toEqual({ schemaVersion: 1, enabled: false, model: { mode: "inherit" } });
 	});
 });
 

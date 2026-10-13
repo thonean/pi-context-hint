@@ -11,12 +11,13 @@ import {
 	ENTRY_TYPE,
 	latestGenerationRecord,
 	projectPaths,
+	readConfig,
 	writeConfig,
 	writeContextHintSettings,
 	writeGeneration,
 	type GenerationRecord,
 } from "../src/core";
-import {
+import registerContextHint, {
 	contextHintArgumentCompletions,
 	contextHintCard,
 	contextHintStatus,
@@ -62,9 +63,125 @@ test("restores last model only for fresh sessions", () => {
 	expect(shouldRestoreLastSessionModel("resume", 0)).toBe(false);
 });
 
-test("repair retry keeps schema-constrained tool output", async () => {
+test("model, enable, and status notices show effective summary model and thinking", async () => {
+	const temp = await mkdtemp(join(tmpdir(), "context-hint-model-notice-"));
+	const agentDir = join(temp, "agent");
+	const cwd = join(temp, "project");
+	await mkdir(cwd);
+	await writeFile(join(cwd, "README.md"), "notice test");
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+
+	try {
+		const mainModel = { provider: "openai", id: "main", api: "openai-responses", reasoning: true };
+		const summaryModel = { provider: "anthropic", id: "summary", api: "anthropic-messages", reasoning: true };
+		const paths = projectPaths(agentDir, `dir:${await realpath(cwd)}`);
+		await writeConfig(paths, { ...DEFAULT_CONFIG, thinkingLevels: { "openai/main": "medium" } });
+		await writeContextHintSettings(agentDir, { ...DEFAULT_CONTEXT_HINT_SETTINGS, motion: "reduce" });
+
+		const listeners = new Map<string, (event: any, ctx: any) => any>();
+		const commands = new Map<string, (args: string, ctx: any) => any>();
+		const notices: Array<{ message: string; level: string }> = [];
+		const availableModels = [summaryModel];
+		let picker: any;
+		const ctx = {
+			hasUI: true,
+			mode: "tui",
+			cwd,
+			model: mainModel,
+			thinkingLevel: "high",
+			scopedModels: [{ model: summaryModel }],
+			modelRegistry: { getAvailable: () => availableModels },
+			sessionManager: { getSessionId: () => "session", getEntries: () => [], getBranch: () => [] },
+			ui: {
+				theme,
+				notify: (message: string, level: string) => notices.push({ message, level }),
+				setWidget() {},
+				setStatus() {},
+				custom(factory: (tui: any, theme: any, keybindings: any, done: (value: any) => void) => any) {
+					return new Promise((resolve) => {
+						picker = factory({ requestRender() {} }, theme, {}, resolve);
+					});
+				},
+			},
+		} as any;
+		const pi = {
+			on: (name: string, listener: (event: any, ctx: any) => any) => listeners.set(name, listener),
+			registerCommand: (name: string, command: { handler: (args: string, ctx: any) => any }) => commands.set(name, command.handler),
+			registerEntryRenderer() {},
+			registerShortcut() {},
+			exec: async () => ({ code: 1, stdout: "", stderr: "" }),
+		};
+		registerContextHint(pi as any);
+		await listeners.get("session_start")!({ reason: "resume" }, ctx);
+
+		const saving = commands.get("context-hint")!("model", ctx);
+		picker.handleInput("\x1b[B");
+		picker.handleInput("\x1b[C");
+		picker.handleInput("\r");
+		await saving;
+		const saveMessage = notices.at(-1)?.message;
+		await commands.get("context-hint")!("status", ctx);
+		const explicitStatus = notices.at(-1)?.message;
+		const configBeforeCancel = await readConfig(paths);
+		const noticesBeforeCancel = notices.length;
+		const cancel = commands.get("context-hint")!("model", ctx);
+		picker.handleInput("\x1b");
+		await cancel;
+		expect(await readConfig(paths)).toEqual(configBeforeCancel);
+		expect(notices).toHaveLength(noticesBeforeCancel);
+		await commands.get("context-hint")!("enable", ctx);
+		const explicitEnable = notices.at(-1)?.message;
+
+		ctx.scopedModels = [];
+		availableModels.length = 0;
+		await commands.get("context-hint")!("status", ctx);
+		const unavailableStatus = notices.at(-1)?.message;
+		await commands.get("context-hint")!("enable", ctx);
+		const unavailableEnable = notices.at(-1)?.message;
+
+		const inheritSave = commands.get("context-hint")!("model", ctx);
+		picker.handleInput("\r");
+		await inheritSave;
+		const inheritMessage = notices.at(-1)?.message;
+		await commands.get("context-hint")!("status", ctx);
+		const inheritStatus = notices.at(-1)?.message;
+		await commands.get("context-hint")!("enable", ctx);
+		const inheritEnable = notices.at(-1)?.message;
+		expect(ctx.model).toBe(mainModel);
+		expect(ctx.thinkingLevel).toBe("high");
+
+		ctx.model = undefined;
+		await commands.get("context-hint")!("status", ctx);
+		const noModelStatus = notices.at(-1)?.message;
+		await commands.get("context-hint")!("enable", ctx);
+		const noModelEnable = notices.at(-1)?.message;
+
+		expect(saveMessage).toBe("Context Hint summary model anthropic/summary; thinking minimal saved.");
+		expect(explicitStatus).toContain("summary model anthropic/summary; thinking minimal");
+		expect(explicitEnable).toContain("summary model anthropic/summary; thinking minimal");
+		expect(explicitEnable).toContain("Alt+O toggles cards");
+		expect(explicitEnable).toContain("Next settled interaction generates a card.");
+		expect(unavailableStatus).toContain("summary model anthropic/summary (unavailable); thinking unavailable");
+		expect(unavailableEnable).toContain("summary model anthropic/summary (unavailable); thinking unavailable");
+		expect(inheritMessage).toBe("Context Hint summary model openai/main (inherit); thinking medium saved.");
+		expect(inheritStatus).toContain("summary model openai/main (inherit); thinking medium");
+		expect(inheritEnable).toContain("summary model openai/main (inherit); thinking medium");
+		expect(noModelStatus).toContain("summary model inherit current (no active model); thinking unavailable");
+		expect(noModelEnable).toContain("summary model inherit current (no active model); thinking unavailable");
+		expect(ctx.model).toBeUndefined();
+		expect(ctx.thinkingLevel).toBe("high");
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		await rm(temp, { recursive: true, force: true });
+	}
+});
+
+test("summary and repair requests keep schema tools and selected thinking level", async () => {
 	let attempts = 0;
 	let repairRequest: any;
+	const requestOptions: any[] = [];
 	const invalid = {
 		turnDelta: { summary: "Implemented Context Hint", decisions: [] },
 		sessionPatch: { status: "in_progress" },
@@ -87,16 +204,18 @@ test("repair retry keeps schema-constrained tool output", async () => {
 		attentionCue: { level: "none" as const },
 	};
 	const ctx = {
+		thinkingLevel: "high",
 		modelRegistry: {
-			complete: async (_model: unknown, request: any, options: any) => {
+			streamSimple: (_model: unknown, request: any, options: any) => {
 				attempts++;
+				requestOptions.push(options);
 				if (attempts === 1) {
-					return { content: [{ type: "toolCall", id: "bad", name: "context_hint_v1", arguments: invalid }] };
+					return { result: async () => ({ content: [{ type: "toolCall", id: "bad", name: "context_hint_v1", arguments: invalid }] }) };
 				}
 				repairRequest = { request, options };
 				const prompt = request.messages[0].content[0].text;
 				const output = prompt.includes('"accomplished":[]') ? valid : invalid;
-				return { content: [{ type: "text", text: JSON.stringify(output) }] };
+				return { result: async () => ({ content: [{ type: "text", text: JSON.stringify(output) }] }) };
 			},
 		},
 	} as any;
@@ -118,12 +237,15 @@ test("repair retry keeps schema-constrained tool output", async () => {
 		EMPTY_SESSION_STATE,
 		EMPTY_PROJECT_STATE,
 		new AbortController().signal,
+		"xhigh",
 	);
 
 	expect(attempts).toBe(2);
 	expect(repairRequest.request.tools).toHaveLength(1);
 	expect(repairRequest.request.tools[0].name).toBe("context_hint_v1");
-	expect(repairRequest.options.toolChoice).toEqual({ type: "function", name: "context_hint_v1" });
+	expect(repairRequest.options.toolChoice).toBe("auto");
+	expect(requestOptions.map((options) => options.reasoning)).toEqual(["xhigh", "xhigh"]);
+	expect(ctx.thinkingLevel).toBe("high");
 	expect(hint).toEqual(valid);
 });
 
@@ -145,11 +267,13 @@ test("accepts JSON split across multiple text blocks", async () => {
 	});
 	const ctx = {
 		modelRegistry: {
-			complete: async () => ({
-				content: [
-					{ type: "text", text: valid.slice(0, 40) },
-					{ type: "text", text: valid.slice(40) },
-				],
+			streamSimple: () => ({
+				result: async () => ({
+					content: [
+						{ type: "text", text: valid.slice(0, 40) },
+						{ type: "text", text: valid.slice(40) },
+					],
+				}),
 			}),
 		},
 	} as any;
@@ -165,7 +289,7 @@ test("accepts JSON split across multiple text blocks", async () => {
 	};
 
 	await expect(
-		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal),
+		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off"),
 	).resolves.toMatchObject({ turnDelta: { accomplished: ["Recovered"] } });
 });
 
@@ -173,10 +297,12 @@ test("falls back to a valid empty hint after two unusable responses", async () =
 	let attempts = 0;
 	const ctx = {
 		modelRegistry: {
-			complete: async () => {
-				attempts++;
-				return { content: [] };
-			},
+			streamSimple: () => ({
+				result: async () => {
+					attempts++;
+					return { content: [] };
+				},
+			}),
 		},
 	} as any;
 	const evidence = {
@@ -191,7 +317,7 @@ test("falls back to a valid empty hint after two unusable responses", async () =
 	};
 
 	await expect(
-		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal),
+		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off"),
 	).resolves.toMatchObject({
 		turnDelta: { accomplished: [], failures: [expect.stringContaining("no usable")], codeCues: [] },
 		attentionCue: { level: "info" },
@@ -217,8 +343,10 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	};
 	const ctx = {
 		modelRegistry: {
-			complete: async () => ({
-				content: [{ type: "toolCall", id: "hint", name: "context_hint_v1", arguments: args }],
+			streamSimple: () => ({
+				result: async () => ({
+					content: [{ type: "toolCall", id: "hint", name: "context_hint_v1", arguments: args }],
+				}),
 			}),
 		},
 	} as any;
@@ -234,7 +362,7 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	};
 
 	await expect(
-		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal),
+		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off"),
 	).resolves.toMatchObject({ attentionCue: { level: "none" } });
 });
 
@@ -656,7 +784,7 @@ test("footer eye stays synced without repainting scrollback across peeks, blinks
 		expect(notifications).toEqual([]);
 		await commands.get("context-hint")!("status", ctx);
 		expect(notifications.at(-1)?.level).toBe("info");
-		expect(notifications.at(-1)?.message).toContain("Context Hint enabled; model ");
+		expect(notifications.at(-1)?.message).toContain("Context Hint enabled; summary model inherit current (no active model); thinking unavailable");
 		expect(notifications.at(-1)?.message).toContain("Shortcut: Alt+O — expand/collapse cards");
 		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
 		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: collapsed");
@@ -705,7 +833,7 @@ test("footer eye stays synced without repainting scrollback across peeks, blinks
 		const beforeEnableNotices = notifications.length;
 		await commands.get("context-hint")!("enable", ctx);
 		expect(notifications.slice(beforeEnableNotices)).toEqual([
-			{ message: "Context Hint enabled. Alt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
+			{ message: "Context Hint enabled; summary model inherit current (no active model); thinking unavailable.\nAlt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
 		]);
 		expect([...timers.values()].map(({ delay }) => delay)).toEqual([8_000]);
 		expect(statuses.get("context-hint")).toContain("⢄⣀⡠ context-hint: error");
@@ -817,7 +945,7 @@ test("footer eye stays synced without repainting scrollback across peeks, blinks
 		const beforeReducedEnableNotices = notifications.length;
 		await commands.get("context-hint")!("enable", ctx);
 		expect(notifications.slice(beforeReducedEnableNotices)).toEqual([
-			{ message: "Context Hint enabled. Alt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
+			{ message: "Context Hint enabled; summary model inherit current (no active model); thinking unavailable.\nAlt+O toggles cards.\nNext settled interaction generates a card.", level: "info" },
 		]);
 		expectEyesMatch("open");
 		expect(timers.size).toBe(0);
