@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export const ENTRY_TYPE = "context-hint-v1";
 export const SCHEMA_VERSION = 1;
+export const MODEL_THINKING_LEVEL_ORDER: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export type SessionStatus =
 	| "exploring"
@@ -119,6 +121,7 @@ export interface ContextHintConfig {
 	schemaVersion: 1;
 	enabled: boolean;
 	model: { mode: "inherit" } | { mode: "explicit"; provider: string; id: string };
+	thinkingLevels?: Record<string, ModelThinkingLevel>;
 	lastSessionModel?: { provider: string; id: string };
 }
 
@@ -494,6 +497,8 @@ function isConfig(value: unknown): value is ContextHintConfig {
 		isObject(value.model) &&
 		(value.model.mode === "inherit" ||
 			(value.model.mode === "explicit" && typeof value.model.provider === "string" && typeof value.model.id === "string")) &&
+		(value.thinkingLevels === undefined ||
+			(isObject(value.thinkingLevels) && Object.values(value.thinkingLevels).every((level) => MODEL_THINKING_LEVEL_ORDER.includes(level)))) &&
 		(value.lastSessionModel === undefined ||
 			(isObject(value.lastSessionModel) &&
 				typeof value.lastSessionModel.provider === "string" &&

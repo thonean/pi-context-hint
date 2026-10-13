@@ -1,6 +1,6 @@
 import { realpath, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { Type, uuidv7, validateToolCall, type Api, type Model, type Tool, type ToolCall } from "@earendil-works/pi-ai";
+import { Type, getSupportedThinkingLevels, uuidv7, validateToolCall, type Api, type JsonObject, type Model, type ModelThinkingLevel, type SimpleStreamOptions, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import {
 	getAgentDir,
 	type ExtensionAPI,
@@ -9,13 +9,14 @@ import {
 	type Theme,
 	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
-import { type AutocompleteItem, type Component, type TuiMainScreen, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AutocompleteItem, type Component, type TuiMainScreen, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONTEXT_HINT_SETTINGS,
 	EMPTY_PROJECT_STATE,
 	EMPTY_SESSION_STATE,
 	ENTRY_TYPE,
+	MODEL_THINKING_LEVEL_ORDER,
 	SCHEMA_VERSION,
 	cloneProjectState,
 	cloneSessionState,
@@ -465,7 +466,7 @@ export default function (pi: ExtensionAPI) {
 				await writeConfig(project.paths, config);
 				syncEyeAnimation(ctx);
 				pulse(ctx);
-				ctx.ui.notify("Context Hint enabled. Alt+O toggles cards.\nNext settled interaction generates a card.", "info");
+				ctx.ui.notify(`Context Hint enabled; ${summaryModelThinking(ctx, config)}.\nAlt+O toggles cards.\nNext settled interaction generates a card.`, "info");
 				return;
 			}
 			if (action === "disable") {
@@ -476,8 +477,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (action === "model") {
-				config = await chooseModel(ctx, config);
+				const nextConfig = await chooseModel(ctx, config);
+				if (!nextConfig) return;
+				config = nextConfig;
 				await writeConfig(project.paths, config);
+				ctx.ui.notify(`Context Hint ${summaryModelThinking(ctx, config)} saved.`, "info");
 				return;
 			}
 			if (action === "regenerate") {
@@ -560,11 +564,12 @@ export default function (pi: ExtensionAPI) {
 			await failRecord(record, "Configured summary model is unavailable. Run /context-hint model.", ctx);
 			return;
 		}
+		const thinkingLevel = resolveThinkingLevel(model, config.thinkingLevels?.[modelThinkingKey(model)]).level;
 
 		const controller = new AbortController();
 		controllers.set(record.generationId, controller);
 		try {
-			const hint = await generateHint(ctx, model, record.evidence!, record.baseSessionState, latestProject.state, controller.signal);
+			const hint = await generateHint(ctx, model, record.evidence!, record.baseSessionState, latestProject.state, controller.signal, thinkingLevel);
 			if (closed || record.status !== "pending" || record.sessionId !== activeSessionId) return;
 
 			const knownPaths = new Set(record.evidence!.knownPaths);
@@ -966,23 +971,169 @@ function resolveModel(ctx: ExtensionContext, config: ContextHintConfig): Model<A
 	return findAllowedModel(ctx, config.model);
 }
 
-async function chooseModel(ctx: ExtensionCommandContext, config: ContextHintConfig): Promise<ContextHintConfig> {
-	if (!ctx.hasUI) {
-		ctx.ui.notify("Model picker requires UI", "warning");
-		return config;
+export function modelThinkingKey(model: Pick<Model<Api>, "provider" | "id">): string {
+	return `${model.provider}/${model.id}`;
+}
+
+export function resolveThinkingLevel(
+	model: Model<Api>,
+	saved?: ModelThinkingLevel,
+): { level: ModelThinkingLevel; fallbackFrom?: ModelThinkingLevel } {
+	const supported = getSupportedThinkingLevels(model);
+	if (saved === undefined) return { level: supported.includes("off") ? "off" : (supported[0] ?? "off") };
+	if (supported.includes(saved)) return { level: saved };
+
+	const savedIndex = MODEL_THINKING_LEVEL_ORDER.indexOf(saved);
+	const atOrBelow = supported.filter((level) => MODEL_THINKING_LEVEL_ORDER.indexOf(level) <= savedIndex);
+	return { level: atOrBelow.at(-1) ?? supported[0] ?? "off", fallbackFrom: saved };
+}
+
+function supportsThinking(model: Model<Api>): boolean {
+	return model.reasoning === true && getSupportedThinkingLevels(model).some((level) => level !== "off");
+}
+
+interface ThinkingLevelDraft {
+	level: ModelThinkingLevel;
+	fallbackFrom?: ModelThinkingLevel;
+}
+
+class ContextHintModelPicker implements Component {
+	private selected: number;
+	private drafts = new Map<string, ThinkingLevelDraft>();
+
+	constructor(
+		private mainModel: Model<Api> | undefined,
+		private models: Model<Api>[],
+		private config: ContextHintConfig,
+		private theme: Theme,
+		private requestRender: () => void,
+		private done: (result: ContextHintConfig | undefined) => void,
+	) {
+		const configuredModel = config.model;
+		this.selected = configuredModel.mode === "inherit"
+			? 0
+			: Math.max(0, models.findIndex((model) => model.provider === configuredModel.provider && model.id === configuredModel.id) + 1);
+	}
+
+	render(width: number): string[] {
+		const options = [
+			`Inherit current model (${this.mainModel ? modelThinkingKey(this.mainModel) : "not set"})`,
+			...this.models.map(modelThinkingKey),
+		];
+		const visibleCount = Math.min(7, options.length);
+		const start = Math.max(0, Math.min(this.selected - 3, options.length - visibleCount));
+		const end = start + visibleCount;
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Context Hint summary model")),
+			this.theme.fg("muted", "Choose model; adjust summary thinking independently."),
+			"",
+		];
+		if (start > 0) lines.push(this.theme.fg("dim", "  …"));
+		for (let index = start; index < end; index++) {
+			const selected = index === this.selected;
+			lines.push(this.theme.fg(selected ? "accent" : "muted", `${selected ? "›" : " "} ${options[index]}`));
+		}
+		if (end < options.length) lines.push(this.theme.fg("dim", "  …"));
+
+		const model = this.currentModel();
+		lines.push("");
+		if (!model) {
+			lines.push(this.theme.fg("muted", "Thinking unavailable: no current model."));
+		} else {
+			const draft = this.thinkingDraft(model);
+			if (!supportsThinking(model)) {
+				lines.push(this.theme.fg("muted", "Thinking not supported"));
+			} else {
+				lines.push(this.theme.fg("text", `Thinking level: ${this.theme.bold(draft.level)}`));
+				const levels = getSupportedThinkingLevels(model).map((level) =>
+					level === draft.level ? this.theme.fg("accent", this.theme.bold(`[${level}]`)) : this.theme.fg("dim", level),
+				);
+				lines.push(...wrapTextWithAnsi(`Supported: ${levels.join(" · ")}`, width));
+			}
+			if (draft.fallbackFrom) {
+				lines.push(...wrapTextWithAnsi(
+					this.theme.fg("warning", `Saved level ${draft.fallbackFrom} is unsupported; showing ${draft.level}. Enter saves fallback.`),
+					width,
+				));
+			}
+		}
+		lines.push("");
+		lines.push(this.theme.fg("dim", "↑/↓ model  ←/→ thinking  enter save  esc cancel"));
+		return lines.map((line) => truncateToWidth(line, width, ""));
+	}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape")) {
+			this.done(undefined);
+			return;
+		}
+		if (matchesKey(data, "return")) {
+			this.done(this.selectedConfig());
+			return;
+		}
+		if (matchesKey(data, "up")) this.selected = Math.max(0, this.selected - 1);
+		else if (matchesKey(data, "down")) this.selected = Math.min(this.models.length, this.selected + 1);
+		else if (matchesKey(data, "left") || matchesKey(data, "right")) this.adjustThinking(matchesKey(data, "right") ? 1 : -1);
+		else return;
+		this.requestRender();
+	}
+
+	private currentModel(): Model<Api> | undefined {
+		return this.selected === 0 ? this.mainModel : this.models[this.selected - 1];
+	}
+
+	private thinkingDraft(model: Model<Api>): ThinkingLevelDraft {
+		const key = modelThinkingKey(model);
+		let draft = this.drafts.get(key);
+		if (!draft) {
+			draft = resolveThinkingLevel(model, this.config.thinkingLevels?.[key]);
+			this.drafts.set(key, draft);
+		}
+		return draft;
+	}
+
+	private adjustThinking(direction: -1 | 1): void {
+		const model = this.currentModel();
+		if (!model || !supportsThinking(model)) return;
+		const levels = getSupportedThinkingLevels(model);
+		const draft = this.thinkingDraft(model);
+		const index = levels.indexOf(draft.level);
+		const next = Math.max(0, Math.min(levels.length - 1, index + direction));
+		if (next === index) return;
+		draft.level = levels[next]!;
+		delete draft.fallbackFrom;
+	}
+
+	private selectedConfig(): ContextHintConfig {
+		const model = this.currentModel();
+		const next: ContextHintConfig = {
+			...this.config,
+			model: this.selected === 0
+				? { mode: "inherit" }
+				: { mode: "explicit", provider: this.models[this.selected - 1]!.provider, id: this.models[this.selected - 1]!.id },
+		};
+		if (model) {
+			const key = modelThinkingKey(model);
+			next.thinkingLevels = { ...this.config.thinkingLevels, [key]: this.thinkingDraft(model).level };
+		}
+		return next;
+	}
+}
+
+export async function chooseModel(
+	ctx: ExtensionCommandContext,
+	config: ContextHintConfig,
+): Promise<ContextHintConfig | undefined> {
+	if (!ctx.hasUI || ctx.mode !== "tui") {
+		ctx.ui.notify("Context Hint model picker requires terminal UI", "warning");
+		return undefined;
 	}
 	const models = ctx.scopedModels.length > 0 ? ctx.scopedModels.map((item) => item.model) : ctx.modelRegistry.getAvailable();
-	const choices = ["Inherit current model", ...models.map((model) => `${model.provider}/${model.id}`)];
-	const selected = await ctx.ui.select("Context Hint summary model", choices);
-	if (!selected) return config;
-	if (selected === choices[0]) {
-		ctx.ui.notify("Context Hint will inherit current model", "info");
-		return { ...config, model: { mode: "inherit" } };
-	}
-	const model = models[choices.indexOf(selected) - 1];
-	if (!model) return config;
-	ctx.ui.notify(`Context Hint model: ${model.provider}/${model.id}`, "info");
-	return { ...config, model: { mode: "explicit", provider: model.provider, id: model.id } };
+	return ctx.ui.custom((tui, theme, _keybindings, done) =>
+		new ContextHintModelPicker(ctx.model, models, config, theme, () => tui.requestRender(), done),
+	);
 }
 
 export async function generateHint(
@@ -992,15 +1143,16 @@ export async function generateHint(
 	sessionState: SessionState,
 	projectState: ProjectState,
 	signal: AbortSignal,
+	thinkingLevel: ModelThinkingLevel = "off",
 ): Promise<ContextHintV1> {
 	const prompt = buildPrompt(evidence, sessionState, projectState);
 	let firstError = "context_hint_v1 tool call missing";
 	try {
-		const response = await ctx.modelRegistry.complete(
-			model as Model<any>,
+		const response = await ctx.modelRegistry.streamSimple(
+			model,
 			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage(prompt)], tools: [CONTEXT_HINT_TOOL] },
-			requestOptions(model, signal),
-		);
+			requestOptions(signal, thinkingLevel),
+		).result();
 		return decodeHint(response, evidence);
 	} catch (error) {
 		if (signal.aborted) throw new Error("Generation aborted");
@@ -1009,11 +1161,11 @@ export async function generateHint(
 
 	const repair = `${prompt}\n\nREPAIR: Previous output failed validation: ${redactAndTruncate(firstError, 500)}. Return only one JSON object with exactly this shape, replacing array contents and optional patch fields as needed: {"turnDelta":{"accomplished":[],"learned":[],"ruledOut":[],"codeCues":[],"verification":[],"failures":[],"decisionsMade":[],"questionsForHuman":[]},"sessionPatch":{"status":"exploring"},"projectPatch":null,"attentionCue":{"level":"none"}}. sessionPatch.status must be one of exploring, implementing, verifying, blocked, decision-needed, done. No Markdown fence, prose, or invented evidence.`;
 	try {
-		const response = await ctx.modelRegistry.complete(
-			model as Model<any>,
+		const response = await ctx.modelRegistry.streamSimple(
+			model,
 			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage(repair)], tools: [CONTEXT_HINT_TOOL] },
-			requestOptions(model, signal),
-		);
+			requestOptions(signal, thinkingLevel),
+		).result();
 		return decodeHint(response, evidence);
 	} catch (error) {
 		if (signal.aborted) throw new Error("Generation aborted");
@@ -1040,25 +1192,15 @@ function userMessage(text: string) {
 	return { role: "user" as const, content: [{ type: "text" as const, text }], timestamp: Date.now() };
 }
 
-function requestOptions(model: Model<Api>, signal: AbortSignal, forceTool = true): any {
-	const base = { signal, cacheRetention: "none", sessionId: uuidv7(), maxTokens: 3_500 };
-	if (!forceTool) return base;
-	switch (model.api) {
-		case "openai-completions":
-			return { ...base, toolChoice: { type: "function", function: { name: CONTEXT_HINT_TOOL.name } } };
-		case "openai-responses":
-			return { ...base, toolChoice: { type: "function", name: CONTEXT_HINT_TOOL.name } };
-		case "anthropic-messages":
-		case "bedrock-converse-stream":
-			return { ...base, toolChoice: { type: "tool", name: CONTEXT_HINT_TOOL.name } };
-		case "google-generative-ai":
-		case "google-vertex":
-			return { ...base, toolChoice: "any" };
-		case "mistral-conversations":
-			return { ...base, toolChoice: { type: "function", function: { name: CONTEXT_HINT_TOOL.name } } };
-		default:
-			return base;
-	}
+function requestOptions(signal: AbortSignal, thinkingLevel: ModelThinkingLevel): SimpleStreamOptions {
+	return {
+		signal,
+		cacheRetention: "none",
+		sessionId: uuidv7(),
+		maxTokens: 3_500,
+		toolChoice: "auto",
+		...(thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+	};
 }
 
 function decodeHint(
@@ -1106,15 +1248,18 @@ function emptyHint(message: string): ContextHintV1 {
 }
 
 function normalizeToolCall(toolCall: ToolCall): ToolCall {
-	const args = structuredClone(toolCall.arguments ?? {}) as Record<string, unknown>;
-	if (typeof args.attentionCue === "string" && ["none", "info", "decision-needed", "blocked", "risk"].includes(args.attentionCue)) {
-		args.attentionCue = { level: args.attentionCue };
+	const args = structuredClone(toolCall.arguments ?? {});
+	const attentionCue = args.attentionCue;
+	if (typeof attentionCue === "string" && ["none", "info", "decision-needed", "blocked", "risk"].includes(attentionCue)) {
+		args.attentionCue = { level: attentionCue };
 	}
-	if (args.sessionPatch && typeof args.sessionPatch === "object" && !Array.isArray(args.sessionPatch)) {
-		const patch = args.sessionPatch as Record<string, unknown>;
-		if (patch.status === "in_progress") patch.status = "implementing";
-	}
+	const patch = args.sessionPatch;
+	if (isJsonObject(patch) && patch.status === "in_progress") patch.status = "implementing";
 	return { ...toolCall, arguments: args };
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function stripFence(text: string): string {
@@ -1140,15 +1285,30 @@ function isDurableProjectPath(path: string): boolean {
 		/(^|\/)docs\/adr\//.test(path);
 }
 
+function summaryModelThinking(ctx: ExtensionContext, config: ContextHintConfig): string {
+	const model = resolveModel(ctx, config);
+	if (!model) {
+		const configured = config.model.mode === "inherit"
+			? "inherit current (no active model)"
+			: `${config.model.provider}/${config.model.id} (unavailable)`;
+		return `summary model ${configured}; thinking unavailable`;
+	}
+	const inherited = config.model.mode === "inherit" ? " (inherit)" : "";
+	const resolved = resolveThinkingLevel(model, config.thinkingLevels?.[modelThinkingKey(model)]);
+	const thinking = supportsThinking(model)
+		? `thinking ${resolved.level}${resolved.fallbackFrom ? ` (saved ${resolved.fallbackFrom} unsupported)` : ""}`
+		: "thinking off (not supported)";
+	return `summary model ${modelThinkingKey(model)}${inherited}; ${thinking}`;
+}
+
 function showStatus(
 	ctx: ExtensionCommandContext,
 	config: ContextHintConfig,
 	settings: ContextHintSettings,
 	project: ProjectIdentity,
 ): void {
-	const model = config.model.mode === "inherit" ? "inherit current" : `${config.model.provider}/${config.model.id}`;
 	const message = [
-		`Context Hint ${config.enabled ? "enabled" : "disabled"}; model ${model}; expanded ${settings.expanded}; motion ${settings.motion}; state ${project.paths.dir}`,
+		`Context Hint ${config.enabled ? "enabled" : "disabled"}; ${summaryModelThinking(ctx, config)}; expanded ${settings.expanded}; motion ${settings.motion}; state ${project.paths.dir}`,
 		"Shortcut: Alt+O — expand/collapse cards",
 		...(!config.enabled ? ["Context Hint generation is disabled; existing cards can still be expanded or collapsed."] : []),
 	].join("\n");
