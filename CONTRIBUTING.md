@@ -31,7 +31,7 @@ bun run build
 bun run check
 ```
 
-`bun run check` runs the full test suite, strict TypeScript checking, the production build, and `npm pack --dry-run`.
+`bun run check` runs the full test suite, strict TypeScript checking, the production build, and `npm pack --dry-run`. GitHub Actions runs this command for every pull request. The required `check` status must pass before GitHub allows a merge into `main`.
 
 ## Package checks
 
