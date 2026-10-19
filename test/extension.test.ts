@@ -366,6 +366,346 @@ test("normalizes legacy scalar attention cues before validation", async () => {
 	).resolves.toMatchObject({ attentionCue: { level: "none" } });
 });
 
+test("registered tool events retain completion and failure evidence by call id", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.beforeAgentStart("finish the tool run");
+		for (let index = 0; index < 30; index++) {
+			const args = { path: `src/tool-${index}.ts`, api_key: "sk-per3-evidence-secret" };
+			harness.startTool(`call-${index}`, `tool-${index}`, args);
+			if (index === 29) args.path = "src/mutated-after-start.ts";
+		}
+		for (let index = 29; index >= 0; index--) {
+			harness.endTool(`call-${index}`, `tool-${index}`, `result-${index}`, index >= 18);
+		}
+		harness.startTool("last-failure", "trailing-failure", { path: "src/trailing-failure.ts" });
+		harness.endTool("last-failure", "trailing-failure", "last failure", true);
+		harness.endTool("call-25", "tool-25", "late duplicate", false);
+
+		const { payload } = parseSummaryRequest(await harness.settle());
+		const tools = payload.turnEvidence.tools;
+		expect(tools).toHaveLength(24);
+		expect(tools.map((tool: any) => tool.name)).toEqual([
+			...Array.from({ length: 4 }, (_, offset) => `tool-${29 - offset}`),
+			...Array.from({ length: 7 }, (_, offset) => `tool-${24 - offset}`),
+			"tool-11",
+			...Array.from({ length: 11 }, (_, offset) => `tool-${10 - offset}`),
+			"trailing-failure",
+		]);
+		expect(tools.filter((tool: any) => !tool.ok)).toHaveLength(12);
+		expect(tools.at(-1)).toMatchObject({ name: "trailing-failure", ok: false, result: "last failure" });
+		expect(tools[0]).toMatchObject({
+			name: "tool-29",
+			ok: false,
+			input: '{"path":"src/tool-29.ts","api_key":"[REDACTED]"}',
+			result: "result-29",
+		});
+		expect(payload.turnEvidence.knownPaths).toContain("nested/src/tool-0.ts");
+		expect(payload.turnEvidence.knownPaths).not.toContain("nested/src/tool-29.ts");
+		expect(payload.turnEvidence.tools.some((tool: any) => tool.result === "late duplicate")).toBe(false);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("overlapping retention windows refill one unique 24-fact pool", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.beforeAgentStart("run many failures");
+		for (let index = 1; index <= 30; index++) {
+			harness.startTool(`call-${index}`, `tool-${index}`, { path: `src/tool-${index}.ts` });
+		}
+		for (let index = 1; index <= 30; index++) {
+			harness.endTool(`call-${index}`, `tool-${index}`, `failure-${index}`, true);
+		}
+
+		const { payload } = parseSummaryRequest(await harness.settle());
+		const names = payload.turnEvidence.tools.map((tool: any) => tool.name);
+		expect(names).toEqual([
+			...Array.from({ length: 4 }, (_, offset) => `tool-${offset + 1}`),
+			...Array.from({ length: 20 }, (_, offset) => `tool-${offset + 11}`),
+		]);
+		expect(new Set(names).size).toBe(24);
+		expect(payload.turnEvidence.tools).toHaveLength(24);
+		expect(payload.turnEvidence.tools.filter((tool: any) => !tool.ok)).toHaveLength(24);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("failure and recovery remain separate from current blockers", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.beforeAgentStart("recover test failure");
+		harness.startTool("failed", "test", { path: "src/broken.ts" });
+		harness.endTool("failed", "test", "test suite failed", true);
+		harness.startTool("unrelated", "read", { path: "README.md" });
+		harness.endTool("unrelated", "read", "read project notes", false);
+		harness.startTool("recovery", "edit", { path: "src/fixed.ts" });
+		harness.endTool("recovery", "edit", "test suite passed", false);
+
+		const { payload } = parseSummaryRequest(await harness.settle());
+		expect(payload.turnEvidence.tools.map((tool: any) => [tool.name, tool.ok, tool.result])).toEqual([
+			["test", false, "test suite failed"],
+			["read", true, "read project notes"],
+			["edit", true, "test suite passed"],
+		]);
+		expect(payload.priorSessionState.blockers).toEqual([]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("settled capture swaps before file reads and ignores late tool ends", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.beforeAgentStart("old turn");
+		harness.startTool("old-call", "old-tool", { path: "src/old.ts" });
+		harness.endTool("old-call", "old-tool", "old result", false);
+		harness.startTool("late-call", "late-tool", { path: "src/late.ts" });
+		const firstSettlement = harness.beginSettlement();
+
+		harness.beforeAgentStart("new turn");
+		harness.endTool("late-call", "late-tool", "late old result", true);
+		harness.startTool("new-call", "new-tool", { path: "src/new.ts" });
+		harness.endTool("new-call", "new-tool", "new result", false);
+		await firstSettlement;
+		await harness.waitForRequestCount(1);
+
+		const secondRequest = await harness.settle();
+		const firstTools = parseSummaryRequest(harness.requests[0]).payload.turnEvidence.tools;
+		const secondTools = parseSummaryRequest(secondRequest).payload.turnEvidence.tools;
+		expect(firstTools.map((tool: any) => [tool.name, tool.result])).toEqual([["old-tool", "old result"]]);
+		expect(secondTools.map((tool: any) => [tool.name, tool.result])).toEqual([["new-tool", "new result"]]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("session changes discard pending inputs before late results arrive", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.startTool("stale-call", "stale-tool", { path: "src/stale.ts" });
+		await harness.startSession("new-session");
+		harness.endTool("stale-call", "stale-tool", "stale result", true);
+		harness.startTool("current-call", "current-tool", { path: "src/current.ts" });
+		harness.endTool("current-call", "current-tool", "current result", false);
+
+		const { payload } = parseSummaryRequest(await harness.settle());
+		expect(payload.turnEvidence.tools.map((tool: any) => [tool.name, tool.result])).toEqual([["current-tool", "current result"]]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("unmatched tool ends do not create evidence", async () => {
+	const harness = await createToolEvidenceHarness();
+	try {
+		harness.beforeAgentStart("no tools completed");
+		harness.endTool("missing-start", "orphan", "orphan result", true);
+		const { payload } = parseSummaryRequest(await harness.settle());
+		expect(payload.turnEvidence.tools).toEqual([]);
+		expect(payload.turnEvidence.knownPaths).toEqual([]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("summary packing keeps valid redacted JSON, current blockers, and actual code-cue paths", async () => {
+	const evidence = {
+		schemaVersion: 1 as const,
+		capturedAt: "2026-09-15T00:00:00.000Z",
+		userPrompt: `USER_PROMPT_PIN ${'quote " slash \\ 💡 '.repeat(800)}`,
+		assistantText: `ASSISTANT_BACKGROUND ${"assistant ".repeat(900)}`,
+		imageCount: 0,
+		tools: Array.from({ length: 24 }, (_, index) => ({
+			name: index === 23 ? "latest" : `tool-${index}`,
+			ok: true,
+			input: `input-${index} ${"i".repeat(690)}`,
+			result: index === 23 ? "LATEST_RESULT_PIN" : `result-${index} ${"r".repeat(980)}`,
+			paths: [`src/tool-${index}.ts`],
+		})),
+		knownPaths: Array.from({ length: 24 }, (_, index) => `src/tool-${index}.ts`),
+		projectFacts: [{ path: "CONTEXT.md", excerpt: `PROJECT_FILE_BACKGROUND ${"file ".repeat(900)}` }],
+	};
+	const sessionState = {
+		goal: `SESSION_GOAL_PIN api_key="sk-per3-secret" ${"goal ".repeat(600)}`,
+		currentFocus: "CURRENT_FOCUS_PIN",
+		currentHypothesis: "CURRENT_HYPOTHESIS_PIN",
+		status: "blocked" as const,
+		openLoops: ["OPEN_LOOP_PIN"],
+		ruledOut: ["RULED_OUT_PIN"],
+		blockers: [`CURRENT_BLOCKER_PIN ${"blocker ".repeat(500)}`],
+		nextSteps: [`CURRENT_NEXT_STEP_PIN ${"next ".repeat(500)}`],
+	};
+	const projectState = {
+		summary: `PROJECT_SUMMARY_BACKGROUND ${"summary ".repeat(700)}`,
+		purpose: "PROJECT_PURPOSE_PIN",
+		architecture: [`ARCHITECTURE_BACKGROUND ${"architecture ".repeat(300)}`],
+		constraints: ["PROJECT_CONSTRAINT_PIN"],
+		conventions: ["PROJECT_CONVENTION_PIN"],
+		importantDecisions: [{ decision: "PROJECT_DECISION_PIN", rationale: "PROJECT_RATIONALE_PIN" }],
+		currentPhase: "PROJECT_PHASE_PIN",
+	};
+	const originals = structuredClone({ evidence, sessionState, projectState });
+	const requests: any[] = [];
+	let droppedPath: string | undefined;
+	const model = { provider: "test", id: "summary", api: "openai-responses", reasoning: true } as any;
+	const ctx = {
+		modelRegistry: {
+			streamSimple: (_model: unknown, request: any) => {
+				requests.push(request);
+				const text = request.messages[0].content[0].text;
+				const prefix = text.split("\n\nREPAIR:")[0];
+				let payload: any;
+				try {
+					payload = JSON.parse(prefix);
+				} catch {}
+				const calls = requests.length;
+				if (calls === 1) {
+					droppedPath = evidence.knownPaths.find((path) => !payload?.turnEvidence.knownPaths.includes(path));
+					const invalid = emptyHint();
+					invalid.turnDelta.codeCues = [{ path: droppedPath ?? "src/not-sent.ts", kind: "verified", reason: "not in request" }] as any;
+					return { result: async () => ({ content: [{ type: "text", text: JSON.stringify(invalid) }] }) };
+				}
+				const valid = emptyHint();
+				const knownPath = payload.turnEvidence.knownPaths.at(-1);
+				valid.turnDelta.codeCues = [{ path: knownPath, kind: "verified", reason: "sent evidence" }] as any;
+				return { result: async () => ({ content: [{ type: "text", text: JSON.stringify(valid) }] }) };
+			},
+		},
+	} as any;
+
+	const hint = await generateHint(
+		ctx,
+		model,
+		evidence as any,
+		sessionState as any,
+		projectState as any,
+		new AbortController().signal,
+	);
+
+	expect(requests).toHaveLength(2);
+	const firstText = requests[0].messages[0].content[0].text;
+	const repairText = requests[1].messages[0].content[0].text;
+	const repairPrefix = repairText.slice(0, repairText.indexOf("\n\nREPAIR:"));
+	expect(firstText.length).toBeLessThanOrEqual(20_000);
+	expect(repairText.length).toBeLessThanOrEqual(20_000);
+	const firstPayload = JSON.parse(firstText);
+	const repairPayload = JSON.parse(repairPrefix);
+	expect(repairPayload).toEqual(firstPayload);
+	expect(firstPayload.turnEvidence.tools.at(-1)).toMatchObject({ name: "latest", ok: true, result: "LATEST_RESULT_PIN" });
+	expect(firstPayload.turnEvidence.tools.length).toBeLessThan(24);
+	expect(firstPayload.turnEvidence.knownPaths).toEqual(
+		[...new Set(firstPayload.turnEvidence.tools.filter((tool: any) => tool.ok).flatMap((tool: any) => tool.paths))].sort(),
+	);
+	expect(droppedPath).toBeDefined();
+	expect(firstPayload.coverage).toEqual({
+		tools: "partial",
+		toolText: "partial",
+		session: "partial",
+		project: "partial",
+		conversation: "partial",
+	});
+	expect(requests[0].systemPrompt).toContain("Partial evidence cannot prove that a fact is absent");
+	expect(firstPayload.turnEvidence.userPrompt).toContain("USER_PROMPT_PIN");
+	expect(firstPayload.priorSessionState.blockers[0]).toContain("CURRENT_BLOCKER_PIN");
+	expect(firstPayload.priorSessionState.blockers).not.toEqual([]);
+	expect(firstText).not.toContain("sk-per3-secret");
+	expect(hint.turnDelta.codeCues).toEqual([{ path: firstPayload.turnEvidence.knownPaths.at(-1), kind: "verified", reason: "sent evidence" }]);
+	expect({ evidence, sessionState, projectState }).toEqual(originals);
+});
+
+test("repair reserves space for the full redacted error suffix", async () => {
+	const requests: any[] = [];
+	let attempts = 0;
+	const valid = emptyHint();
+	const ctx = {
+		modelRegistry: {
+			streamSimple: (_model: unknown, request: any) => {
+				requests.push(request);
+				attempts++;
+				return {
+					result: async () => {
+						if (attempts === 1) throw new Error("E".repeat(5_000));
+					return { content: [{ type: "text", text: JSON.stringify(valid) }] };
+				},
+				};
+			},
+		},
+	} as any;
+	const evidence = {
+		schemaVersion: 1 as const,
+		capturedAt: "2026-09-15T00:00:00.000Z",
+		userPrompt: "repair budget",
+		assistantText: "",
+		imageCount: 0,
+		tools: [],
+		knownPaths: [],
+		projectFacts: [],
+	};
+
+	await generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal);
+	const firstText = requests[0].messages[0].content[0].text;
+	const repairText = requests[1].messages[0].content[0].text;
+	expect(firstText.length).toBeLessThanOrEqual(20_000);
+	expect(repairText.length).toBeLessThanOrEqual(20_000);
+	expect(JSON.parse(repairText.slice(0, repairText.indexOf("\n\nREPAIR:")))).toEqual(JSON.parse(firstText));
+	const repairError = repairText.slice(repairText.indexOf("Previous output failed validation: ") + "Previous output failed validation: ".length, repairText.indexOf(". Return only one JSON object"));
+	expect(repairError.length).toBeLessThanOrEqual(500);
+	expect(repairError).toContain("[truncated]");
+	expect(repairError).not.toContain("E".repeat(501));
+});
+
+test("summary packing fails before sending when the pinned final result cannot fit", async () => {
+	let requests = 0;
+	const ctx = {
+		modelRegistry: {
+			streamSimple: () => {
+				requests++;
+				return { result: async () => ({ content: [] }) };
+			},
+		},
+	} as any;
+	const evidence = {
+		schemaVersion: 1 as const,
+		capturedAt: "2026-09-15T00:00:00.000Z",
+		userPrompt: "",
+		assistantText: "",
+		imageCount: 0,
+		tools: [{ name: "N".repeat(21_000), ok: true, input: "", result: "final result", paths: [] }],
+		knownPaths: [],
+		projectFacts: [],
+	};
+
+	await expect(
+		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal),
+	).rejects.toThrow();
+	expect(requests).toBe(0);
+});
+
+test("card details show blockers and failures before older verification", () => {
+	const record = pendingRecord();
+	record.status = "ready";
+	record.hint = emptyHint();
+	record.hint.turnDelta.failures = ["FAILURE_HISTORY_PIN"];
+	record.hint.turnDelta.verification = Array.from({ length: 8 }, (_, index) => `OLD_VERIFICATION_${index + 1}`);
+	record.sessionState = {
+		...EMPTY_SESSION_STATE,
+		blockers: ["CURRENT_BLOCKER_PIN"],
+		openLoops: ["OPEN_LOOP_PIN"],
+	};
+	record.projectState = EMPTY_PROJECT_STATE;
+
+	const rendered = contextHintCard(() => record, () => 0, true, theme).render(100).join("\n");
+	expect(rendered.indexOf("blocked: CURRENT_BLOCKER_PIN")).toBeLessThan(rendered.indexOf("failed: FAILURE_HISTORY_PIN"));
+	expect(rendered.indexOf("failed: FAILURE_HISTORY_PIN")).toBeLessThan(rendered.indexOf("open: OPEN_LOOP_PIN"));
+	expect(rendered.indexOf("open: OPEN_LOOP_PIN")).toBeLessThan(rendered.indexOf("verified: OLD_VERIFICATION_1"));
+	expect(rendered.match(/(?:blocked:|failed:|open:|verified:|ruled out:)/g)).toHaveLength(6);
+	expect(rendered).not.toContain("OLD_VERIFICATION_7");
+	expect(rendered).not.toContain("BLOCKED");
+});
+
 test("eye animation uses approved three-cell frames and reduced motion stays static", () => {
 	expect(eyeGlyph("open")).toBe("⠢⣋⠔");
 	expect(eyeGlyph("half")).toBe("⠔⣖⠢");
@@ -986,6 +1326,117 @@ function emptyHint() {
 		sessionPatch: {},
 		projectPatch: null,
 		attentionCue: { level: "none" as const },
+	};
+}
+
+function parseSummaryRequest(request: any) {
+	const text = request.messages[0].content[0].text as string;
+	const repairIndex = text.indexOf("\n\nREPAIR:");
+	return {
+		text,
+		payload: JSON.parse(repairIndex < 0 ? text : text.slice(0, repairIndex)),
+	};
+}
+
+async function createToolEvidenceHarness() {
+	const temp = await mkdtemp(join(tmpdir(), "context-hint-evidence-"));
+	const agentDir = join(temp, "agent");
+	const projectRoot = join(temp, "project");
+	const cwdPath = join(projectRoot, "nested");
+	await mkdir(cwdPath, { recursive: true });
+	const cwd = await realpath(cwdPath);
+	await writeFile(join(projectRoot, "README.md"), "tool evidence test project");
+	const sourceRoot = await realpath(projectRoot);
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	await writeConfig(projectPaths(agentDir, `dir:${sourceRoot}`), { ...DEFAULT_CONFIG, enabled: true });
+
+	const listeners = new Map<string, (event: any, ctx: any) => any>();
+	const requests: any[] = [];
+	let sessionId = "evidence-session";
+	const model = { provider: "openai", id: "summary", api: "openai-responses", reasoning: true };
+	const ctx = {
+		hasUI: true,
+		mode: "tui",
+		cwd,
+		model,
+		scopedModels: [],
+		modelRegistry: {
+			getAvailable: () => [model],
+			streamSimple: (_model: unknown, request: any) => {
+				requests.push(request);
+				return { result: async () => ({ content: [{ type: "text", text: JSON.stringify(emptyHint()) }] }) };
+			},
+		},
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getEntries: () => [],
+			getBranch: () => [],
+		},
+		ui: {
+			theme,
+			notify() {},
+			setStatus() {},
+			setWidget() {},
+		},
+		isIdle: () => true,
+		isProjectTrusted: () => true,
+	};
+	const pi = {
+		on: (name: string, listener: (event: any, ctx: any) => any) => listeners.set(name, listener),
+		registerCommand() {},
+		registerShortcut() {},
+		registerEntryRenderer() {},
+		appendEntry() {},
+		exec: async () => ({ code: 1, stdout: "", stderr: "" }),
+	};
+	registerContextHint(pi as any);
+	await listeners.get("session_start")!({ reason: "resume" }, ctx);
+
+	return {
+		ctx,
+		listeners,
+		requests,
+		beforeAgentStart(prompt: string) {
+			listeners.get("before_agent_start")!({ prompt, images: [] }, ctx);
+		},
+		startTool(toolCallId: string, toolName: string, args: unknown) {
+			listeners.get("tool_execution_start")!({ toolCallId, toolName, args }, ctx);
+		},
+		endTool(toolCallId: string, toolName: string, result: string, isError: boolean) {
+			listeners.get("tool_execution_end")!({
+				toolCallId,
+				toolName,
+				result: { content: [{ type: "text", text: result }] },
+				isError,
+			}, ctx);
+		},
+		beginSettlement() {
+			return listeners.get("agent_settled")!({ aborted: false }, ctx);
+		},
+		async settle() {
+			const requestIndex = requests.length;
+			await listeners.get("agent_settled")!({ aborted: false }, ctx);
+			await this.waitForRequestCount(requestIndex + 1);
+			return requests[requestIndex];
+		},
+		async waitForRequestCount(count: number) {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				if (requests.length >= count) return;
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+			throw new Error(`summary request ${count} did not arrive`);
+		},
+		async startSession(nextSessionId: string) {
+			sessionId = nextSessionId;
+			await listeners.get("session_start")!({ reason: "new" }, ctx);
+		},
+		async close() {
+			await listeners.get("session_shutdown")!({ reason: "quit" }, ctx);
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			await rm(temp, { recursive: true, force: true });
+		},
 	};
 }
 
