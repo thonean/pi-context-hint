@@ -608,7 +608,7 @@ test("summary packing keeps valid redacted JSON, current blockers, and actual co
 		conversation: "partial",
 	});
 	expect(requests[0].systemPrompt).toContain("Partial evidence cannot prove that a fact is absent");
-	expect(firstPayload.userPrompt).toContain("USER_PROMPT_PIN");
+	expect(firstPayload.turnEvidence.userPrompt).toContain("USER_PROMPT_PIN");
 	expect(firstPayload.priorSessionState.blockers[0]).toContain("CURRENT_BLOCKER_PIN");
 	expect(firstPayload.priorSessionState.blockers).not.toEqual([]);
 	expect(firstText).not.toContain("sk-per3-secret");
