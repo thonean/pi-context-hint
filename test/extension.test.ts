@@ -392,11 +392,14 @@ test("registered tool events retain completion and failure evidence by call id",
 			...Array.from({ length: 11 }, (_, offset) => `tool-${10 - offset}`),
 			"trailing-failure",
 		]);
-		expect(tools.filter((tool: any) => !tool.ok)).toHaveLength(8);
+		expect(tools.filter((tool: any) => !tool.ok)).toHaveLength(12);
 		expect(tools.at(-1)).toMatchObject({ name: "trailing-failure", ok: false, result: "last failure" });
-		expect(tools[0]).toMatchObject({ name: "tool-29", ok: false, input: expect.stringContaining('"path":"src/tool-29.ts"'), result: "result-29" });
-		expect(tools[0].input).toContain("[REDACTED]");
-		expect(tools[0].input).not.toContain("sk-per3-evidence-secret");
+		expect(tools[0]).toMatchObject({
+			name: "tool-29",
+			ok: false,
+			input: '{"path":"src/tool-29.ts","api_key":"[REDACTED]"}',
+			result: "result-29",
+		});
 		expect(payload.turnEvidence.knownPaths).toContain("nested/src/tool-0.ts");
 		expect(payload.turnEvidence.knownPaths).not.toContain("nested/src/tool-29.ts");
 		expect(payload.turnEvidence.tools.some((tool: any) => tool.result === "late duplicate")).toBe(false);
@@ -1339,8 +1342,9 @@ async function createToolEvidenceHarness() {
 	const temp = await mkdtemp(join(tmpdir(), "context-hint-evidence-"));
 	const agentDir = join(temp, "agent");
 	const projectRoot = join(temp, "project");
-	const cwd = join(projectRoot, "nested");
-	await mkdir(cwd, { recursive: true });
+	const cwdPath = join(projectRoot, "nested");
+	await mkdir(cwdPath, { recursive: true });
+	const cwd = await realpath(cwdPath);
 	await writeFile(join(projectRoot, "README.md"), "tool evidence test project");
 	const sourceRoot = await realpath(projectRoot);
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

@@ -232,12 +232,26 @@ interface EntryData {
 	generationId?: string;
 }
 
+interface CapturedToolFact {
+	order: number;
+	failureOrder?: number;
+	fact: ToolFact;
+}
+
+interface PendingToolInput {
+	name: string;
+	input: string;
+	paths: string[];
+}
+
 interface InteractionCapture {
 	userPrompt: string;
 	imageCount: number;
 	assistantText: string[];
-	toolInputs: Map<string, { name: string; args: unknown }>;
-	tools: ToolFact[];
+	toolInputs: Map<string, PendingToolInput>;
+	tools: CapturedToolFact[];
+	completedCount: number;
+	failureCount: number;
 }
 
 interface ProjectIdentity {
@@ -301,6 +315,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		interaction = emptyInteraction();
 		clearAnimationTimers();
 		closed = false;
 		if (ctx.mode === "tui") {
@@ -384,26 +399,32 @@ export default function (pi: ExtensionAPI) {
 		await rememberSessionModel(event.model);
 	});
 
-	pi.on("tool_execution_start", (event) => {
-		interaction.toolInputs.set(event.toolCallId, { name: event.toolName, args: event.args });
+	pi.on("tool_execution_start", (event, ctx) => {
+		interaction.toolInputs.set(event.toolCallId, {
+			name: event.toolName,
+			input: redactAndTruncate(event.args, 700),
+			paths: collectPaths(event.args, ctx.cwd, project?.sourceRoot ?? ctx.cwd),
+		});
 	});
 
-	pi.on("tool_execution_end", (event, ctx) => {
-		if (interaction.tools.length >= MAX_TOOL_FACTS) return;
+	pi.on("tool_execution_end", (event) => {
 		const start = interaction.toolInputs.get(event.toolCallId);
-		interaction.tools.push({
-			name: start?.name ?? event.toolName,
+		if (!start) return;
+		interaction.toolInputs.delete(event.toolCallId);
+		retainToolFact(interaction, {
+			name: start.name,
 			ok: !event.isError,
-			input: redactAndTruncate(start?.args ?? {}, 700),
+			input: start.input,
 			result: redactAndTruncate(extractResultText(event.result), 1_000),
-			paths: collectPaths(start?.args, ctx.cwd, project?.sourceRoot ?? ctx.cwd),
+			paths: start.paths,
 		});
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (closed || ctx.mode !== "tui" || !config.enabled || !project || !projectDocument) return;
-		const evidence = await buildEvidence(interaction, project.sourceRoot);
+		const capture = interaction;
 		interaction = emptyInteraction();
+		const evidence = await buildEvidence(capture, project.sourceRoot);
 		await scheduleGeneration(ctx, evidence);
 	});
 
@@ -421,6 +442,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event, ctx) => {
 		closed = true;
+		interaction = emptyInteraction();
 		clearAnimationTimers();
 		try {
 			await cancelPending(`Generation interrupted by session ${event.reason}.`, ctx);
@@ -882,14 +904,15 @@ async function loadRecords(
 
 async function buildEvidence(capture: InteractionCapture, sourceRoot: string): Promise<TurnEvidence> {
 	const projectFacts = await readProjectFacts(sourceRoot);
+	const tools = capture.tools.map(({ fact }) => fact);
 	return {
 		schemaVersion: 1,
 		capturedAt: new Date().toISOString(),
 		userPrompt: redactAndTruncate(capture.userPrompt, 4_000),
 		assistantText: redactAndTruncate(capture.assistantText.join("\n\n"), 6_000),
 		imageCount: capture.imageCount,
-		tools: capture.tools.slice(0, MAX_TOOL_FACTS),
-		knownPaths: codeCuePaths(capture.tools),
+		tools,
+		knownPaths: codeCuePaths(tools),
 		projectFacts,
 	};
 }
@@ -906,7 +929,24 @@ async function readProjectFacts(sourceRoot: string): Promise<Array<{ path: strin
 }
 
 function emptyInteraction(): InteractionCapture {
-	return { userPrompt: "", imageCount: 0, assistantText: [], toolInputs: new Map(), tools: [] };
+	return { userPrompt: "", imageCount: 0, assistantText: [], toolInputs: new Map(), tools: [], completedCount: 0, failureCount: 0 };
+}
+
+function retainToolFact(capture: InteractionCapture, fact: ToolFact): void {
+	const order = ++capture.completedCount;
+	const failureOrder = fact.ok ? undefined : ++capture.failureCount;
+	const candidates = [...capture.tools, { order, failureOrder, fact }];
+	const protectedFacts = candidates.filter(
+		(candidate) =>
+			candidate.order <= 4 ||
+			candidate.order > capture.completedCount - 12 ||
+			(candidate.failureOrder !== undefined && candidate.failureOrder > capture.failureCount - 8),
+	);
+	const unprotectedFacts = candidates
+		.filter((candidate) => !protectedFacts.includes(candidate))
+		.sort((left, right) => right.order - left.order);
+	protectedFacts.push(...unprotectedFacts.slice(0, Math.min(capture.completedCount, MAX_TOOL_FACTS) - protectedFacts.length));
+	capture.tools = protectedFacts.sort((left, right) => left.order - right.order);
 }
 
 function extractResultText(result: unknown): string {
@@ -1445,11 +1485,11 @@ export function contextHintCard(
 				if (next) lines.push(line(), line(theme.fg("success", theme.bold("NEXT"))), line(next));
 
 				const details = [
-					...hint.turnDelta.verification.map((item) => `verified: ${item}`),
-					...hint.turnDelta.ruledOut.map((item) => `ruled out: ${item}`),
+					...session.blockers.map((item) => `blocked: ${item}`),
 					...hint.turnDelta.failures.map((item) => `failed: ${item}`),
 					...session.openLoops.map((item) => `open: ${item}`),
-					...session.blockers.map((item) => `blocked: ${item}`),
+					...hint.turnDelta.verification.map((item) => `verified: ${item}`),
+					...hint.turnDelta.ruledOut.map((item) => `ruled out: ${item}`),
 				];
 				if (details.length > 0) {
 					lines.push(line(), line(theme.fg("muted", theme.bold("DETAIL"))));
