@@ -20,7 +20,8 @@
   "license": "MIT",
   "type": "module",
   "files": [
-    "dist/context-hint.js",
+    "extensions/context-hint.ts",
+    "src/core.ts",
     "README.md",
     "LICENSE",
     "assets/context-hint-logo.svg",
@@ -29,7 +30,7 @@
   "pi": {
     "image": "https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.2/assets/context-hint-still.png",
     "extensions": [
-      "dist/context-hint.js"
+      "extensions/context-hint.ts"
     ]
   },
   "scripts": {
