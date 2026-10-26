@@ -35,11 +35,11 @@ bun run check
 
 ## Package checks
 
-`bun run package:smoke` builds a real npm tarball, checks its exact allowlist, installs it in a temporary directory without dev dependencies, and verifies the installed Pi manifest target.
+`bun run package:smoke` builds a real npm tarball, checks its exact allowlist, installs it in a temporary directory without dev dependencies, and verifies that the installed source entry registers the Context Hint command through Pi's loader.
 
 `bun run release:check` reruns the full repository checks, then performs the strict tarball checks. It rejects placeholder publication metadata and `private: true`.
 
-Tarballs built from this checkout include the extension, README, license, logo, and static preview. They exclude demo MP4 and GIF files. The published package excludes demo MP4 and GIF files. The README GIF loads from the separate public [`pi-context-hint-media` repository](https://github.com/thonean/pi-context-hint-media). Keep demo media outside the npm file allowlist.
+Tarballs built from this checkout include the TypeScript extension source, its local core module, README, license, logo, and static preview. They exclude the generated bundle and demo MP4 and GIF files. The README GIF loads from the separate public [`pi-context-hint-media` repository](https://github.com/thonean/pi-context-hint-media). Keep generated output and demo media outside the npm file allowlist.
 
 ## Manual Pi smoke test
 

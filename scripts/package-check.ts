@@ -1,16 +1,18 @@
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 
 export const EXPECTED_TARBALL_ENTRIES = [
 	"package/LICENSE",
 	"package/README.md",
 	"package/assets/context-hint-logo.svg",
 	"package/assets/context-hint-still.png",
-	"package/dist/context-hint.js",
+	"package/extensions/context-hint.ts",
 	"package/package.json",
+	"package/src/core.ts",
 ];
 
 interface PackageManifest {
@@ -28,11 +30,11 @@ interface PackageManifest {
 
 export function validatePackageMetadata(manifest: PackageManifest, release = false): string[] {
 	const errors: string[] = [];
-	if (manifest.files?.slice().sort().join("\n") !== ["LICENSE", "README.md", "assets/context-hint-logo.svg", "assets/context-hint-still.png", "dist/context-hint.js"].join("\n")) {
-		errors.push('package.json files must list the extension, README, license, logo, and static preview');
+	if (manifest.files?.slice().sort().join("\n") !== ["LICENSE", "README.md", "assets/context-hint-logo.svg", "assets/context-hint-still.png", "extensions/context-hint.ts", "src/core.ts"].join("\n")) {
+		errors.push('package.json files must list the extension source, core source, README, license, logo, and static preview');
 	}
-	if (manifest.pi?.extensions?.length !== 1 || manifest.pi.extensions[0] !== "dist/context-hint.js") {
-		errors.push('package.json pi.extensions must point to "dist/context-hint.js"');
+	if (manifest.pi?.extensions?.length !== 1 || manifest.pi.extensions[0] !== "extensions/context-hint.ts") {
+		errors.push('package.json pi.extensions must point to "extensions/context-hint.ts"');
 	}
 	if (!release) return errors;
 
@@ -107,14 +109,36 @@ async function main(): Promise<void> {
 			);
 			const installedRoot = join(consumer, "node_modules", ...(manifest.name ?? "").split("/"));
 			const installedManifest = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8")) as PackageManifest;
-			const installedTarget = join(installedRoot, "dist/context-hint.js");
-			if (installedManifest.pi?.extensions?.[0] !== "dist/context-hint.js") {
-				errors.push("installed package manifest does not point to dist/context-hint.js");
+			const installedTarget = join(installedRoot, "extensions/context-hint.ts");
+			const installedCore = join(installedRoot, "src/core.ts");
+			if (installedManifest.pi?.extensions?.[0] !== "extensions/context-hint.ts") {
+				errors.push("installed package manifest does not point to extensions/context-hint.ts");
 			}
-			try {
-				await readFile(installedTarget);
-			} catch {
-				errors.push("installed package is missing dist/context-hint.js");
+			for (const [path, description] of [[installedTarget, "extensions/context-hint.ts"], [installedCore, "src/core.ts"]]) {
+				try {
+					await readFile(path);
+				} catch {
+					errors.push(`installed package is missing ${description}`);
+				}
+			}
+
+			const loader = new DefaultResourceLoader({
+				cwd: consumer,
+				agentDir: join(workspace, "agent"),
+				additionalExtensionPaths: [installedRoot],
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+			});
+			await loader.reload();
+			const loaded = loader.getExtensions();
+			if (loaded.errors.length > 0) {
+				errors.push(`installed package extension failed to load: ${loaded.errors.map(({ error }) => error).join("; ")}`);
+			}
+			if (loaded.extensions.length !== 1 || !loaded.extensions[0]?.commands.has("context-hint")) {
+				errors.push("installed package did not register exactly one context-hint command extension");
 			}
 		}
 	} catch (error) {

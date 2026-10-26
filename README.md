@@ -26,13 +26,21 @@ The card is a **human-facing recovery cue**. It does not monitor other agents or
 
 ## Try it
 
-Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. It requires Pi 1.1.0 or later. Install the published package with Pi:
+Context Hint is a [Pi coding agent](https://pi.dev/) TUI extension. It requires Pi 1.1.0 or later. Choose one installation source.
+
+Install the published npm release:
 
 ```bash
 pi install npm:pi-context-hint
 ```
 
-In an existing Pi session, run `/reload` after installation. Bun is only needed when you run the extension from a local checkout.
+Or install the latest GitHub source:
+
+```bash
+pi install https://github.com/thonean/pi-context-hint
+```
+
+In an existing Pi session, run `/reload` after installation. Pi loads the published TypeScript source directly, so package installation does not need a build. Use Bun to build the bundle when you run the local development command below.
 
 Generation starts **disabled**. Enabling it sends selected interaction evidence and previous Project / Session state to a summary model after each settled turn, normally in one extra request. [See model use, token cost, and context](#model-use-token-cost-and-context). In Pi, run:
 
