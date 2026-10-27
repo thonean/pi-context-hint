@@ -12,6 +12,7 @@ import {
 	latestGenerationRecord,
 	projectPaths,
 	readConfig,
+	readGeneration,
 	writeConfig,
 	writeContextHintSettings,
 	writeGeneration,
@@ -249,6 +250,359 @@ test("summary and repair requests keep schema tools and selected thinking level"
 	expect(hint).toEqual(valid);
 });
 
+test("corrects an explicitly rejected Off level to an advertised Low level", async () => {
+	const model = {
+		provider: "openai",
+		id: "summary",
+		api: "openai-responses",
+		baseUrl: "https://api.example.test/v1",
+		reasoning: true,
+		thinkingLevelMap: { off: "none", low: "low", medium: "medium", high: "high" },
+	} as any;
+	const requests: Array<{ request: any; options: any }> = [];
+	const warnings: Array<[string, string, boolean]> = [];
+	const ctx = {
+		ui: { notify() {} },
+		modelRegistry: {
+			streamSimple: (_model: unknown, request: any, options: any) => {
+				requests.push({ request, options });
+				return {
+					result: async () => requests.length === 1
+						? {
+							stopReason: "error",
+							errorMessage: `OpenAI API error (400): ${JSON.stringify({
+								code: "unsupported_value",
+								param: "reasoning.effort",
+								type: "invalid_request_error",
+								message: "Unsupported value: 'none' is not supported with the 'summary' model. Supported values are: 'low', 'medium', and 'high'.",
+							})}`,
+							content: [],
+						}
+						: { stopReason: "toolUse", content: [{ type: "text", text: JSON.stringify(emptyHint()) }] },
+				};
+			},
+		},
+	} as any;
+	const recovery = {
+		isCurrent: () => true,
+		getAcceptedLevel: () => undefined,
+		warn: (rejected: string, replacement: string, lowest: boolean) => warnings.push([rejected, replacement, lowest]),
+		accepted() {},
+		invalidate() {},
+	};
+	const evidence = {
+		schemaVersion: 1 as const,
+		capturedAt: "2026-09-15T00:00:00.000Z",
+		userPrompt: "recover summary thinking",
+		assistantText: "",
+		imageCount: 0,
+		tools: [],
+		knownPaths: [],
+		projectFacts: [],
+	};
+
+	const hint = await (generateHint as any)(ctx, model, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off", recovery);
+
+	expect(hint).toEqual(emptyHint());
+	expect(requests).toHaveLength(2);
+	expect(requests.map(({ options }) => options.reasoning)).toEqual([undefined, "low"]);
+	expect(requests[1].request.messages[0].content[0].text).toBe(requests[0].request.messages[0].content[0].text);
+	expect(warnings).toEqual([["off", "low", true]]);
+});
+
+test("chooses corrections from the model mapping and advertised wire values", async () => {
+	const model = recoveryTestModel({
+		thinkingLevelMap: {
+			off: "none",
+			low: "reasoning-small",
+			medium: "reasoning-balanced",
+			high: "reasoning-deep",
+			max: "reasoning-max",
+		},
+	});
+	const requests: Array<{ request: any; options: any }> = [];
+	const ctx = mockSummaryContext([
+		providerError(unsupportedValueError("reasoning-max", "summary", ["reasoning-small", "reasoning-balanced", "reasoning-deep"])),
+		completedSummary(emptyHint()),
+	], requests);
+	const warnings: Array<[string, string, boolean]> = [];
+
+	await (generateHint as any)(ctx, model, summaryEvidence(), EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "max", recoveryHooks({
+		warn: (rejected: string, replacement: string, lowest: boolean) => warnings.push([rejected, replacement, lowest]),
+	}));
+
+	expect(requests.map(({ options }) => options.reasoning)).toEqual(["max", "high"]);
+	expect(warnings).toEqual([["max", "high", false]]);
+});
+
+test("uses the lowest advertised level when none is below the requested level", async () => {
+	const requests: Array<{ request: any; options: any }> = [];
+	const ctx = mockSummaryContext([
+		providerError(unsupportedValueError("low", "summary", ["medium", "high"])),
+		completedSummary(emptyHint()),
+	], requests);
+	await generateHint(ctx, recoveryTestModel(), summaryEvidence(), EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "low");
+	expect(requests.map(({ options }) => options.reasoning)).toEqual(["low", "medium"]);
+});
+
+test("status distinguishes requested thinking from the session's effective level", async () => {
+	const harness = await createToolEvidenceHarness({ responses: [
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+		completedSummary(emptyHint()),
+	] });
+	try {
+		harness.beforeAgentStart("recover summary");
+		await harness.settle();
+		await harness.waitForLatestRecord();
+		await harness.command("status");
+		expect(harness.notifications.at(-1)?.message).toContain("thinking low (requested off; effective for this session)");
+	} finally {
+		await harness.close();
+	}
+});
+
+test("unknown, malformed, and unrelated provider failures do not correct thinking", async () => {
+	const model = recoveryTestModel();
+	const cases = [
+		providerError("Unsupported value: none is not supported. Supported values are low, medium."),
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"]).replace("unsupported_value", "invalid_request")),
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"]).replace("'low' and 'medium'", "'low', 'medium'")),
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"]).replace("reasoning.effort", "temperature")),
+		providerError("401 Unauthorized: invalid_api_key"),
+		providerError("429 Too Many Requests: rate limit exceeded"),
+		providerError("TypeError: fetch failed"),
+		{ stopReason: "length", errorMessage: "Response incomplete: max_output_tokens", content: [] },
+	];
+	for (const response of cases) {
+		const requests: Array<{ request: any; options: any }> = [];
+		const warnings: unknown[] = [];
+		const ctx = mockSummaryContext([response], requests);
+		await expect((generateHint as any)(ctx, model, summaryEvidence(), EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off", recoveryHooks({
+			warn: (...args: unknown[]) => warnings.push(args),
+		}))).rejects.toThrow();
+		expect(requests).toHaveLength(1);
+		expect(warnings).toEqual([]);
+	}
+});
+
+test("correction and format repair use one shared two-request budget", async () => {
+	const model = recoveryTestModel();
+	const correctedRequests: Array<{ request: any; options: any }> = [];
+	const corrected = mockSummaryContext([
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+		{ stopReason: "toolUse", content: [{ type: "text", text: "not JSON" }] },
+	], correctedRequests);
+	await expect((generateHint as any)(corrected, model, summaryEvidence(), EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off", recoveryHooks()))
+		.rejects.toThrow("invalid Context Hint");
+	expect(correctedRequests).toHaveLength(2);
+	expect(correctedRequests[1].request.messages[0].content[0].text).toBe(correctedRequests[0].request.messages[0].content[0].text);
+
+	const repairRequests: Array<{ request: any; options: any }> = [];
+	const repair = mockSummaryContext([
+		{ stopReason: "toolUse", content: [{ type: "text", text: "not JSON" }] },
+		providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+	], repairRequests);
+	await expect((generateHint as any)(repair, model, summaryEvidence(), EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off", recoveryHooks()))
+		.rejects.toThrow("unsupported_value");
+	expect(repairRequests).toHaveLength(2);
+	expect(repairRequests[1].request.messages[0].content[0].text).toContain("\n\nREPAIR:");
+});
+
+test("does not correct or learn after cancellation or a stale response", async () => {
+	const model = recoveryTestModel();
+	const evidence = summaryEvidence();
+	const controller = new AbortController();
+	const requests: Array<{ request: any; options: any }> = [];
+	const callbacks: string[] = [];
+	const cancelled = mockSummaryContext([providerError(unsupportedValueError("none", "summary", ["low", "medium"]))], requests, () => controller.abort());
+	await expect((generateHint as any)(cancelled, model, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, controller.signal, "off", recoveryHooks({
+		warn: () => callbacks.push("warn"),
+		accepted: () => callbacks.push("accepted"),
+		invalidate: () => callbacks.push("invalidate"),
+	}))).rejects.toThrow("Generation aborted");
+	expect(requests).toHaveLength(1);
+	expect(callbacks).toEqual([]);
+
+	let current = true;
+	const staleRequests: Array<{ request: any; options: any }> = [];
+	const stale = mockSummaryContext([completedSummary(emptyHint())], staleRequests, () => { current = false; });
+	await expect((generateHint as any)(stale, model, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "low", recoveryHooks({
+		isCurrent: () => current,
+		accepted: () => callbacks.push("accepted"),
+	}))).rejects.toThrow("no longer current");
+	expect(staleRequests).toHaveLength(1);
+	expect(callbacks).toEqual([]);
+});
+
+test("runGeneration learns accepted thinking before validation and reuses it without another warning", async () => {
+	const model = recoveryTestModel();
+	const harness = await createToolEvidenceHarness({
+		model,
+		responses: [
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			{ stopReason: "toolUse", content: [{ type: "text", text: "not JSON" }] },
+			{ stopReason: "toolUse", content: [{ type: "text", text: "not JSON" }] },
+			completedSummary(emptyHint()),
+		],
+	});
+	try {
+		harness.beforeAgentStart("first summary");
+		await harness.settle();
+		const first = await harness.waitForLatestRecord();
+		expect(first.status).toBe("error");
+		expect(first.hint).toBeUndefined();
+		expect(first.error).toContain("invalid Context Hint");
+		expect(harness.notifications).toEqual([{
+			message: "Current summary model does not support thinking Off. Retrying with Low, its lowest supported level.",
+			level: "warning",
+		}]);
+
+		harness.beforeAgentStart("second summary");
+		await harness.settle();
+		const second = await harness.waitForLatestRecord();
+		expect(second.status).toBe("ready");
+		expect(harness.requestOptions.map((options: any) => options.reasoning)).toEqual([undefined, "low", "low", "low"]);
+		expect(harness.requests[1].messages[0].content[0].text).toBe(harness.requests[0].messages[0].content[0].text);
+		expect(harness.requests[2].messages[0].content[0].text).not.toContain("\n\nREPAIR:");
+		expect(harness.requests[3].messages[0].content[0].text).toContain("\n\nREPAIR:");
+		expect(harness.notifications).toHaveLength(1);
+		expect(harness.events).toEqual(["request:1", "warning", "request:2", "request:3", "request:4"]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("scopes accepted levels to a stable model endpoint", async () => {
+	for (const baseUrl of [undefined, "https://user:secret@api.example.test/v1", "https://api.example.test/v1?token=secret"]) {
+		const harness = await createToolEvidenceHarness({
+			model: recoveryTestModel({ baseUrl }),
+			responses: [
+				providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+				completedSummary(emptyHint()),
+				providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+				completedSummary(emptyHint()),
+			],
+		});
+		try {
+			for (const prompt of ["first endpoint request", "second endpoint request"]) {
+				harness.beforeAgentStart(prompt);
+				await harness.settle();
+				expect((await harness.waitForLatestRecord()).status).toBe("ready");
+			}
+			expect(harness.requestOptions.map((options: any) => options.reasoning)).toEqual([undefined, "low", undefined, "low"]);
+			expect(harness.notifications).toHaveLength(2);
+		} finally {
+			await harness.close();
+		}
+	}
+
+	const model = recoveryTestModel();
+	const harness = await createToolEvidenceHarness({
+		model,
+		responses: [
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			completedSummary(emptyHint()),
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			completedSummary(emptyHint()),
+		],
+	});
+	try {
+		harness.beforeAgentStart("original endpoint");
+		await harness.settle();
+		expect((await harness.waitForLatestRecord()).status).toBe("ready");
+		model.baseUrl = "https://other.example.test/v1";
+		harness.beforeAgentStart("changed endpoint");
+		await harness.settle();
+		expect((await harness.waitForLatestRecord()).status).toBe("ready");
+		expect(harness.requestOptions.map((options: any) => options.reasoning)).toEqual([undefined, "low", undefined, "low"]);
+		expect(harness.notifications).toHaveLength(2);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("invalidates a cached level when the provider later rejects it", async () => {
+	const harness = await createToolEvidenceHarness({
+		model: recoveryTestModel(),
+		responses: [
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			completedSummary(emptyHint()),
+			providerError(unsupportedValueError("low", "summary", ["medium", "high"])),
+			completedSummary(emptyHint()),
+		],
+	});
+	try {
+		harness.beforeAgentStart("learn Low");
+		await harness.settle();
+		expect((await harness.waitForLatestRecord()).status).toBe("ready");
+
+		harness.beforeAgentStart("reject cached Low");
+		await harness.settle();
+		expect((await harness.waitForLatestRecord()).status).toBe("ready");
+		expect(harness.requestOptions.map((options: any) => options.reasoning)).toEqual([undefined, "low", "low", "medium"]);
+		expect(harness.notifications.map(({ message }: { message: string }) => message)).toEqual([
+			"Current summary model does not support thinking Off. Retrying with Low, its lowest supported level.",
+			"Current summary model does not support thinking Low. Retrying with Medium, its lowest supported level.",
+		]);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("a cancelled generation cannot teach the next summary a stale accepted level", async () => {
+	let finishCancelled!: (response: unknown) => void;
+	const cancelledResponse = new Promise((resolve) => { finishCancelled = resolve; });
+	const harness = await createToolEvidenceHarness({
+		model: recoveryTestModel(),
+		responses: [
+			() => cancelledResponse,
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			completedSummary(emptyHint()),
+		],
+	});
+	try {
+		harness.beforeAgentStart("cancelled summary");
+		await harness.beginSettlement();
+		await harness.waitForRequestCount(1);
+		await harness.listeners.get("session_before_tree")!({}, harness.ctx);
+		finishCancelled(providerError(unsupportedValueError("none", "summary", ["low", "medium"])));
+		await harness.waitForLatestRecord();
+
+		harness.beforeAgentStart("current summary");
+		await harness.beginSettlement();
+		await harness.waitForRequestCount(3);
+		const record = await harness.waitForLatestRecord();
+		expect(record.status).toBe("ready");
+		expect(harness.requestOptions.map((options: any) => options.reasoning)).toEqual([undefined, undefined, "low"]);
+		expect(harness.notifications).toHaveLength(1);
+	} finally {
+		await harness.close();
+	}
+});
+
+test("a corrected second response records an error without an empty ready hint", async () => {
+	const harness = await createToolEvidenceHarness({
+		model: recoveryTestModel(),
+		responses: [
+			providerError(unsupportedValueError("none", "summary", ["low", "medium"])),
+			providerError("500: provider unavailable with sk-live-secret"),
+		],
+	});
+	try {
+		harness.beforeAgentStart("failed corrected summary");
+		await harness.settle();
+		const record = await harness.waitForLatestRecord();
+		expect(record.status).toBe("error");
+		expect(record.hint).toBeUndefined();
+		expect(record.error).toContain("provider unavailable");
+		expect(record.error).not.toContain("sk-live-secret");
+		expect(contextHintCard(() => record, () => 0, true, theme).render(80).join("\n")).toContain("ERROR");
+		expect(harness.requests).toHaveLength(2);
+	} finally {
+		await harness.close();
+	}
+});
+
 test("accepts JSON split across multiple text blocks", async () => {
 	const valid = JSON.stringify({
 		turnDelta: {
@@ -293,7 +647,7 @@ test("accepts JSON split across multiple text blocks", async () => {
 	).resolves.toMatchObject({ turnDelta: { accomplished: ["Recovered"] } });
 });
 
-test("falls back to a valid empty hint after two unusable responses", async () => {
+test("throws after two unusable responses instead of returning an empty hint", async () => {
 	let attempts = 0;
 	const ctx = {
 		modelRegistry: {
@@ -318,10 +672,7 @@ test("falls back to a valid empty hint after two unusable responses", async () =
 
 	await expect(
 		generateHint(ctx, { api: "openai-responses" } as any, evidence, EMPTY_SESSION_STATE, EMPTY_PROJECT_STATE, new AbortController().signal, "off"),
-	).resolves.toMatchObject({
-		turnDelta: { accomplished: [], failures: [expect.stringContaining("no usable")], codeCues: [] },
-		attentionCue: { level: "info" },
-	});
+	).rejects.toThrow("Expected one tool call or JSON text");
 	expect(attempts).toBe(2);
 });
 
@@ -616,7 +967,7 @@ test("summary packing keeps valid redacted JSON, current blockers, and actual co
 	expect({ evidence, sessionState, projectState }).toEqual(originals);
 });
 
-test("repair reserves space for the full redacted error suffix", async () => {
+test("repair requests stay within the summary message budget", async () => {
 	const requests: any[] = [];
 	let attempts = 0;
 	const valid = emptyHint();
@@ -627,8 +978,8 @@ test("repair reserves space for the full redacted error suffix", async () => {
 				attempts++;
 				return {
 					result: async () => {
-						if (attempts === 1) throw new Error("E".repeat(5_000));
-					return { content: [{ type: "text", text: JSON.stringify(valid) }] };
+						if (attempts === 1) return { content: [{ type: "text", text: "not JSON" }] };
+						return { content: [{ type: "text", text: JSON.stringify(valid) }] };
 				},
 				};
 			},
@@ -653,8 +1004,7 @@ test("repair reserves space for the full redacted error suffix", async () => {
 	expect(JSON.parse(repairText.slice(0, repairText.indexOf("\n\nREPAIR:")))).toEqual(JSON.parse(firstText));
 	const repairError = repairText.slice(repairText.indexOf("Previous output failed validation: ") + "Previous output failed validation: ".length, repairText.indexOf(". Return only one JSON object"));
 	expect(repairError.length).toBeLessThanOrEqual(500);
-	expect(repairError).toContain("[truncated]");
-	expect(repairError).not.toContain("E".repeat(501));
+	expect(repairError).toContain("JSON");
 });
 
 test("summary packing fails before sending when the pinned final result cannot fit", async () => {
@@ -1311,6 +1661,83 @@ test("footer eye stays synced without repainting scrollback across peeks, blinks
 	}
 });
 
+function recoveryTestModel(overrides: Record<string, unknown> = {}) {
+	return {
+		provider: "openai",
+		id: "summary",
+		api: "openai-responses",
+		baseUrl: "https://api.example.test/v1",
+		reasoning: true,
+		thinkingLevelMap: { off: "none", low: "low", medium: "medium", high: "high", max: "max" },
+		...overrides,
+	} as any;
+}
+
+function summaryEvidence() {
+	return {
+		schemaVersion: 1 as const,
+		capturedAt: "2026-09-15T00:00:00.000Z",
+		userPrompt: "recovery test",
+		assistantText: "",
+		imageCount: 0,
+		tools: [],
+		knownPaths: [],
+		projectFacts: [],
+	};
+}
+
+function unsupportedValueError(attempted: string, model: string, supported: string[]): string {
+	const list = supported.length === 1
+		? `'${supported[0]}'`
+		: supported.length === 2
+			? `'${supported[0]}' and '${supported[1]}'`
+			: `${supported.slice(0, -1).map((value) => `'${value}'`).join(", ")}, and '${supported.at(-1)}'`;
+	return JSON.stringify({
+		code: "unsupported_value",
+		param: "reasoning.effort",
+		type: "invalid_request_error",
+		message: `Unsupported value: '${attempted}' is not supported with the '${model}' model. Supported values are: ${list}.`,
+	});
+}
+
+function providerError(errorMessage: string) {
+	return { stopReason: "error", errorMessage, content: [] };
+}
+
+function completedSummary(hint: unknown) {
+	return { stopReason: "toolUse", content: [{ type: "text", text: JSON.stringify(hint) }] };
+}
+
+function mockSummaryContext(
+	responses: any[],
+	requests: Array<{ request: any; options: any }>,
+	onRequest?: () => void,
+) {
+	let index = 0;
+	return {
+		ui: { notify() {} },
+		modelRegistry: {
+			streamSimple: (_model: unknown, request: any, options: any) => {
+				requests.push({ request, options });
+				onRequest?.();
+				const response = responses[Math.min(index++, responses.length - 1)];
+				return { result: async () => response };
+			},
+		},
+	} as any;
+}
+
+function recoveryHooks(overrides: Record<string, unknown> = {}) {
+	return {
+		isCurrent: () => true,
+		getAcceptedLevel: () => undefined,
+		warn() {},
+		accepted() {},
+		invalidate() {},
+		...overrides,
+	} as any;
+}
+
 function emptyHint() {
 	return {
 		turnDelta: {
@@ -1338,7 +1765,7 @@ function parseSummaryRequest(request: any) {
 	};
 }
 
-async function createToolEvidenceHarness() {
+async function createToolEvidenceHarness(options: { model?: any; responses?: any[] } = {}) {
 	const temp = await mkdtemp(join(tmpdir(), "context-hint-evidence-"));
 	const agentDir = join(temp, "agent");
 	const projectRoot = join(temp, "project");
@@ -1353,8 +1780,21 @@ async function createToolEvidenceHarness() {
 
 	const listeners = new Map<string, (event: any, ctx: any) => any>();
 	const requests: any[] = [];
+	const requestOptions: any[] = [];
+	const entries: any[] = [];
+	const notifications: Array<{ message: string; level: string }> = [];
+	const commands = new Map<string, any>();
+	const events: string[] = [];
+	const responses = options.responses ?? [];
 	let sessionId = "evidence-session";
-	const model = { provider: "openai", id: "summary", api: "openai-responses", reasoning: true };
+	const model = options.model ?? {
+		provider: "openai",
+		id: "summary",
+		api: "openai-responses",
+		baseUrl: "https://api.example.test/v1",
+		reasoning: true,
+		thinkingLevelMap: { off: "none", low: "low", medium: "medium", high: "high" },
+	};
 	const ctx = {
 		hasUI: true,
 		mode: "tui",
@@ -1363,19 +1803,25 @@ async function createToolEvidenceHarness() {
 		scopedModels: [],
 		modelRegistry: {
 			getAvailable: () => [model],
-			streamSimple: (_model: unknown, request: any) => {
+			streamSimple: (_model: unknown, request: any, requestOptionsValue: any) => {
 				requests.push(request);
-				return { result: async () => ({ content: [{ type: "text", text: JSON.stringify(emptyHint()) }] }) };
+				events.push(`request:${requests.length}`);
+				requestOptions.push(requestOptionsValue);
+				const response = responses.shift();
+				return { result: async () => typeof response === "function" ? response(request, requestOptionsValue) : response ?? completedSummary(emptyHint()) };
 			},
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
-			getEntries: () => [],
-			getBranch: () => [],
+			getEntries: () => entries,
+			getBranch: () => entries,
 		},
 		ui: {
 			theme,
-			notify() {},
+			notify: (message: string, level: string) => {
+				notifications.push({ message, level });
+				events.push("warning");
+			},
 			setStatus() {},
 			setWidget() {},
 		},
@@ -1384,10 +1830,10 @@ async function createToolEvidenceHarness() {
 	};
 	const pi = {
 		on: (name: string, listener: (event: any, ctx: any) => any) => listeners.set(name, listener),
-		registerCommand() {},
+		registerCommand: (name: string, command: any) => commands.set(name, command),
 		registerShortcut() {},
 		registerEntryRenderer() {},
-		appendEntry() {},
+		appendEntry: (type: string, data: unknown) => entries.push({ type: "custom", customType: type, data }),
 		exec: async () => ({ code: 1, stdout: "", stderr: "" }),
 	};
 	registerContextHint(pi as any);
@@ -1397,6 +1843,11 @@ async function createToolEvidenceHarness() {
 		ctx,
 		listeners,
 		requests,
+		requestOptions,
+		notifications,
+		events,
+		entries,
+		command: (args: string) => commands.get("context-hint").handler(args, ctx),
 		beforeAgentStart(prompt: string) {
 			listeners.get("before_agent_start")!({ prompt, images: [] }, ctx);
 		},
@@ -1426,6 +1877,18 @@ async function createToolEvidenceHarness() {
 				await new Promise((resolve) => setTimeout(resolve, 1));
 			}
 			throw new Error(`summary request ${count} did not arrive`);
+		},
+		async waitForLatestRecord() {
+			const entry = entries.at(-1);
+			const generationId = entry?.data?.generationId;
+			if (!generationId) throw new Error("summary generation was not scheduled");
+			const paths = projectPaths(agentDir, `dir:${sourceRoot}`);
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const record = await readGeneration(paths, generationId);
+				if (record && record.status !== "pending") return record;
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+			throw new Error("summary generation did not finish");
 		},
 		async startSession(nextSessionId: string) {
 			sessionId = nextSessionId;
