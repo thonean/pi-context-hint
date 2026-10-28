@@ -273,6 +273,12 @@ export default function (pi: ExtensionAPI) {
 	let jobTail = Promise.resolve();
 	const records = new Map<string, GenerationRecord>();
 	const controllers = new Map<string, AbortController>();
+	const acceptedThinkingLevels = new Map<string, ModelThinkingLevel>();
+	let acceptedThinkingRevision = 0;
+	const clearAcceptedThinkingLevels = () => {
+		acceptedThinkingLevels.clear();
+		acceptedThinkingRevision++;
+	};
 	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
 	let spinnerFrame = 0;
 	let eyePhase: EyePhase = "open";
@@ -317,6 +323,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		clearAcceptedThinkingLevels();
 		interaction = emptyInteraction();
 		clearAnimationTimers();
 		closed = false;
@@ -398,6 +405,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async (event) => {
+		clearAcceptedThinkingLevels();
 		await rememberSessionModel(event.model);
 	});
 
@@ -431,6 +439,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_tree", async (_event, ctx) => {
+		clearAcceptedThinkingLevels();
 		await cancelPending("Generation cancelled because session branch changed.", ctx);
 	});
 
@@ -443,6 +452,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
+		clearAcceptedThinkingLevels();
 		closed = true;
 		interaction = emptyInteraction();
 		clearAnimationTimers();
@@ -470,7 +480,7 @@ export default function (pi: ExtensionAPI) {
 				if (!action) return;
 			}
 			if (action === "status") {
-				showStatus(ctx, config, settings, project);
+				showStatus(ctx, config, settings, project, acceptedThinkingLevels);
 				return;
 			}
 			if (action === "toggle") {
@@ -490,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 				await writeConfig(project.paths, config);
 				syncEyeAnimation(ctx);
 				pulse(ctx);
-				ctx.ui.notify(`Context Hint enabled; ${summaryModelThinking(ctx, config)}.\nAlt+O toggles cards.\nNext settled interaction generates a card.`, "info");
+				ctx.ui.notify(`Context Hint enabled; ${summaryModelThinking(ctx, config, acceptedThinkingLevels)}.\nAlt+O toggles cards.\nNext settled interaction generates a card.`, "info");
 				return;
 			}
 			if (action === "disable") {
@@ -503,9 +513,10 @@ export default function (pi: ExtensionAPI) {
 			if (action === "model") {
 				const nextConfig = await chooseModel(ctx, config);
 				if (!nextConfig) return;
+				clearAcceptedThinkingLevels();
 				config = nextConfig;
 				await writeConfig(project.paths, config);
-				ctx.ui.notify(`Context Hint ${summaryModelThinking(ctx, config)} saved.`, "info");
+				ctx.ui.notify(`Context Hint ${summaryModelThinking(ctx, config, acceptedThinkingLevels)} saved.`, "info");
 				return;
 			}
 			if (action === "regenerate") {
@@ -520,6 +531,7 @@ export default function (pi: ExtensionAPI) {
 			if (action === "reset-session") {
 				if (!(await confirmReset(ctx, "Reset Session Context?", "Rolling Session Context and regenerate target will reset. Existing cards stay visible."))) return;
 				await cancelPending("Generation cancelled by session reset.", ctx);
+				clearAcceptedThinkingLevels();
 				pi.appendEntry<EntryData>(ENTRY_TYPE, { kind: "session-reset" });
 				pulse(ctx);
 				ctx.ui.notify("Session Context reset", "info");
@@ -528,6 +540,7 @@ export default function (pi: ExtensionAPI) {
 			if (action === "reset-project") {
 				if (!(await confirmReset(ctx, "Reset Project Context?", "Durable Project Context for every worktree and session of this project will be cleared."))) return;
 				await cancelPending("Generation cancelled by project reset.", ctx);
+				clearAcceptedThinkingLevels();
 				projectDocument = await resetProjectDocument(project.paths, project.identity, project.sourceRoot);
 				ctx.ui.notify("Project Context reset", "info");
 				return;
@@ -588,13 +601,41 @@ export default function (pi: ExtensionAPI) {
 			await failRecord(record, "Configured summary model is unavailable. Run /context-hint model.", ctx);
 			return;
 		}
-		const thinkingLevel = resolveThinkingLevel(model, config.thinkingLevels?.[modelThinkingKey(model)]).level;
+		const thinkingKey = modelThinkingKey(model);
+		const configuredThinkingLevel = config.thinkingLevels?.[thinkingKey];
+		const thinkingLevel = resolveThinkingLevel(model, configuredThinkingLevel).level;
+		const modelSelection = JSON.stringify(config.model);
+		const modelSnapshot = thinkingModelSnapshot(model);
+		const cacheKey = thinkingCacheKey(model, thinkingLevel);
+		const recoveryRevision = acceptedThinkingRevision;
 
 		const controller = new AbortController();
 		controllers.set(record.generationId, controller);
+		const isCurrent = () => {
+			if (closed || controller.signal.aborted || record.status !== "pending" || record.sessionId !== activeSessionId || record.sessionId !== ctx.sessionManager.getSessionId() || projectDocument?.epoch !== record.projectEpoch || acceptedThinkingRevision !== recoveryRevision) return false;
+			if (JSON.stringify(config.model) !== modelSelection || config.thinkingLevels?.[thinkingKey] !== configuredThinkingLevel) return false;
+			const currentModel = resolveModel(ctx, config);
+			return currentModel !== undefined && thinkingModelSnapshot(currentModel) === modelSnapshot;
+		};
+		const recovery: HintRecoveryHooks = {
+			isCurrent,
+			getAcceptedLevel: () => (cacheKey ? acceptedThinkingLevels.get(cacheKey) : undefined),
+			warn: (rejected, replacement, lowest) => notifyThinkingRecovery(ctx, rejected, replacement, lowest),
+			accepted: (level) => {
+				if (isCurrent() && cacheKey && level !== thinkingLevel) acceptedThinkingLevels.set(cacheKey, level);
+			},
+			invalidate: () => {
+				if (isCurrent() && cacheKey) acceptedThinkingLevels.delete(cacheKey);
+			},
+		};
 		try {
-			const hint = await generateHint(ctx, model, record.evidence!, record.baseSessionState, latestProject.state, controller.signal, thinkingLevel);
-			if (closed || record.status !== "pending" || record.sessionId !== activeSessionId) return;
+			const hint = await generateHint(ctx, model, record.evidence!, record.baseSessionState, latestProject.state, controller.signal, thinkingLevel, recovery);
+			if (!isCurrent()) {
+				if (record.status === "pending" && record.sessionId === activeSessionId && !controller.signal.aborted) {
+					await failRecord(record, "Generation was superseded before completion.", ctx);
+				}
+				return;
+			}
 
 			const nextSessionState = mergeSessionState(record.baseSessionState, hint.sessionPatch);
 			const safeProjectPatch = canUpdateProject(latestProject.state, record.evidence!, hint) ? hint.projectPatch : null;
@@ -613,7 +654,10 @@ export default function (pi: ExtensionAPI) {
 			record.error = undefined;
 			await writeGeneration(project.paths, record);
 		} catch (error) {
-			if (record.status === "pending") await failRecord(record, errorMessage(error), ctx);
+			if (record.status === "pending") {
+				if (isCurrent()) await failRecord(record, errorMessage(error), ctx);
+				else if (record.sessionId === activeSessionId && !controller.signal.aborted) await failRecord(record, "Generation was superseded before completion.", ctx);
+			}
 		} finally {
 			controllers.delete(record.generationId);
 			syncSpinner(ctx);
@@ -1176,6 +1220,26 @@ export async function chooseModel(
 	);
 }
 
+interface HintRecoveryHooks {
+	isCurrent(): boolean;
+	getAcceptedLevel(): ModelThinkingLevel | undefined;
+	warn(rejected: ModelThinkingLevel, replacement: ModelThinkingLevel, lowest: boolean): void;
+	accepted(level: ModelThinkingLevel): void;
+	invalidate(): void;
+}
+
+type SummaryResponse = {
+	content: Array<{ type: string; name?: string; arguments?: Record<string, unknown>; text?: string }>;
+	stopReason?: string;
+	errorMessage?: string;
+};
+
+type SummaryOutcome =
+	| { kind: "completed"; response: SummaryResponse }
+	| { kind: "provider-error"; message: string }
+	| { kind: "aborted" }
+	| { kind: "truncated"; message: string };
+
 export async function generateHint(
 	ctx: ExtensionContext,
 	model: Model<Api>,
@@ -1184,34 +1248,180 @@ export async function generateHint(
 	projectState: ProjectState,
 	signal: AbortSignal,
 	thinkingLevel: ModelThinkingLevel = "off",
+	recovery?: HintRecoveryHooks,
 ): Promise<ContextHintV1> {
 	const prepared = prepareSummary(evidence, sessionState, projectState);
-	let firstError = "context_hint_v1 tool call missing";
-	try {
-		const response = await ctx.modelRegistry.streamSimple(
-			model,
-			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage(prepared.prompt)], tools: [CONTEXT_HINT_TOOL] },
-			requestOptions(signal, thinkingLevel),
-		).result();
-		return decodeHint(response, prepared.evidence);
-	} catch (error) {
+	const warn = recovery?.warn ?? ((rejected: ModelThinkingLevel, replacement: ModelThinkingLevel, lowest: boolean) => notifyThinkingRecovery(ctx, rejected, replacement, lowest));
+	let effectiveLevel = recovery && !recovery.isCurrent() ? thinkingLevel : (recovery?.getAcceptedLevel() ?? thinkingLevel);
+	let prompt = prepared.prompt;
+	let attempt = 0;
+	while (attempt < 2) {
 		if (signal.aborted) throw new Error("Generation aborted");
-		firstError = errorMessage(error);
-	}
+		if (recovery && !recovery.isCurrent()) throw new Error("Generation is no longer current");
+		attempt++;
+		const outcome = await requestSummary(ctx, model, prompt, signal, effectiveLevel);
+		if (signal.aborted || outcome.kind === "aborted") throw new Error("Generation aborted");
+		if (recovery && !recovery.isCurrent()) throw new Error("Generation is no longer current");
 
-	const repair = buildRepairPrompt(prepared.prompt, firstError);
-	if (repair.length > SUMMARY_USER_MESSAGE_LIMIT) throw new Error("Context Hint repair request exceeds the message budget");
+		if (outcome.kind === "provider-error") {
+			const attemptedWire = thinkingWireValue(model, effectiveLevel);
+			const rejection = attemptedWire ? parseUnsupportedThinkingError(outcome.message, attemptedWire) : undefined;
+			if (rejection) recovery?.invalidate();
+			if (attempt === 1 && rejection) {
+				const correction = chooseThinkingCorrection(model, thinkingLevel, rejection);
+				if (correction) {
+					if (signal.aborted) throw new Error("Generation aborted");
+					if (recovery && !recovery.isCurrent()) throw new Error("Generation is no longer current");
+					warn(effectiveLevel, correction.level, correction.lowest);
+					effectiveLevel = correction.level;
+					prompt = prepared.prompt;
+					continue;
+				}
+			}
+			throw new Error(summaryProviderError(outcome.message, rejection));
+		}
+		if (outcome.kind === "truncated") throw new Error(sanitizeSummaryError(outcome.message));
+
+		if (effectiveLevel !== thinkingLevel) recovery?.accepted(effectiveLevel);
+		try {
+			return decodeHint(outcome.response, prepared.evidence);
+		} catch (error) {
+			if (attempt === 2) throw new Error(`Summary model returned an invalid Context Hint: ${sanitizeSummaryError(errorMessage(error))}`);
+			prompt = buildRepairPrompt(prepared.prompt, sanitizeSummaryError(errorMessage(error)));
+			if (prompt.length > SUMMARY_USER_MESSAGE_LIMIT) throw new Error("Context Hint repair request exceeds the message budget");
+		}
+	}
+	throw new Error("Summary model returned no usable Context Hint");
+}
+
+async function requestSummary(
+	ctx: ExtensionContext,
+	model: Model<Api>,
+	prompt: string,
+	signal: AbortSignal,
+	thinkingLevel: ModelThinkingLevel,
+): Promise<SummaryOutcome> {
+	let response: SummaryResponse;
 	try {
-		const response = await ctx.modelRegistry.streamSimple(
+		response = await ctx.modelRegistry.streamSimple(
 			model,
-			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage(repair)], tools: [CONTEXT_HINT_TOOL] },
+			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage(prompt)], tools: [CONTEXT_HINT_TOOL] },
 			requestOptions(signal, thinkingLevel),
 		).result();
-		return decodeHint(response, prepared.evidence);
 	} catch (error) {
-		if (signal.aborted) throw new Error("Generation aborted");
-		return emptyHint(`Summary model returned no usable Context Hint: ${errorMessage(error)}`);
+		return signal.aborted ? { kind: "aborted" } : { kind: "provider-error", message: errorMessage(error) };
 	}
+	if (signal.aborted || response.stopReason === "aborted") return { kind: "aborted" };
+	if (response.stopReason === "error") return { kind: "provider-error", message: response.errorMessage ?? "Summary provider request failed" };
+	if (response.stopReason === "length") return { kind: "truncated", message: response.errorMessage ?? "Summary provider response was truncated" };
+	if (response.stopReason && response.stopReason !== "stop" && response.stopReason !== "toolUse") {
+		return { kind: "provider-error", message: response.errorMessage ?? `Summary provider returned an incomplete response (${response.stopReason})` };
+	}
+	return { kind: "completed", response };
+}
+
+type UnsupportedThinkingRejection = { attemptedWire: string; supportedWireValues: string[] };
+
+function parseUnsupportedThinkingError(message: string, attemptedWire: string): UnsupportedThinkingRejection | undefined {
+	if (message.length > 8_192) return undefined;
+	const trimmed = message.trim();
+	const jsonStart = trimmed.indexOf("{");
+	if (jsonStart < 0) return undefined;
+	const prefix = trimmed.slice(0, jsonStart).trim();
+	if (prefix && !/^(?:\d{3}(?: [^{}:]+)?|[A-Za-z][\w -]* \(\d{3}\)):$/.test(prefix)) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed.slice(jsonStart));
+	} catch {
+		return undefined;
+	}
+	if (!isJsonObject(parsed)) return undefined;
+	const envelope = isJsonObject(parsed.error) ? parsed.error : parsed;
+	if (envelope.code !== "unsupported_value" || envelope.param !== "reasoning.effort") return undefined;
+	if (envelope.type !== undefined && envelope.type !== "invalid_request_error") return undefined;
+	if (typeof envelope.message !== "string") return undefined;
+	const match = envelope.message.match(/^Unsupported value: '([^']+)' is not supported with the '([^']+)' model\. Supported values are: (.+)\.$/);
+	if (!match || match[1] !== attemptedWire) return undefined;
+	const supportedWireValues = parseSupportedWireValues(match[3]);
+	return supportedWireValues ? { attemptedWire, supportedWireValues } : undefined;
+}
+
+function parseSupportedWireValues(value: string): string[] | undefined {
+	const matches = [...value.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+	if (matches.length === 0) return undefined;
+	const quoted = matches.map((item) => `'${item}'`);
+	const expected = matches.length === 1
+		? quoted[0]
+		: matches.length === 2
+			? `${quoted[0]} and ${quoted[1]}`
+			: `${quoted.slice(0, -1).join(", ")}, and ${quoted.at(-1)}`;
+	if (value !== expected || new Set(matches).size !== matches.length) return undefined;
+	return matches;
+}
+
+function chooseThinkingCorrection(
+	model: Model<Api>,
+	requestedLevel: ModelThinkingLevel,
+	rejection: UnsupportedThinkingRejection,
+): { level: ModelThinkingLevel; lowest: boolean } | undefined {
+	const supportedValues = new Set(rejection.supportedWireValues);
+	const candidates = getSupportedThinkingLevels(model).flatMap((level) => {
+		const wireValue = thinkingWireValue(model, level);
+		return typeof wireValue === "string" && wireValue !== rejection.attemptedWire && supportedValues.has(wireValue)
+			? [{ level, wireValue }]
+			: [];
+	});
+	const requestedIndex = MODEL_THINKING_LEVEL_ORDER.indexOf(requestedLevel);
+	const candidate = requestedLevel === "off"
+		? candidates[0]
+		: candidates.filter(({ level }) => MODEL_THINKING_LEVEL_ORDER.indexOf(level) <= requestedIndex).at(-1) ?? candidates[0];
+	return candidate ? { level: candidate.level, lowest: candidate === candidates[0] } : undefined;
+}
+
+function thinkingWireValue(model: Model<Api>, level: ModelThinkingLevel): string | undefined {
+	const mapped = model.thinkingLevelMap?.[level];
+	return typeof mapped === "string" ? mapped : undefined;
+}
+
+function summaryProviderError(message: string, rejection?: UnsupportedThinkingRejection): string {
+	if (rejection) {
+		const supported = rejection.supportedWireValues.map((value) => `'${sanitizeSummaryError(value, 80)}'`).join(", ");
+		return `Summary provider rejected reasoning.effort with unsupported_value. Attempted '${sanitizeSummaryError(rejection.attemptedWire, 80)}'. Supported values: ${supported}.`;
+	}
+	return sanitizeSummaryError(message);
+}
+
+function sanitizeSummaryError(message: string, maxChars = 600): string {
+	const withoutUrls = message.replace(/\bhttps?:\/\/[^\s)}\]}>"']+/gi, "[URL redacted]");
+	return redactAndTruncate(withoutUrls, maxChars);
+}
+
+function thinkingModelSnapshot(model: Model<Api>): string {
+	return JSON.stringify([model.provider, model.api, model.baseUrl, model.id, model.reasoning, model.thinkingLevelMap]);
+}
+
+function thinkingCacheKey(model: Model<Api>, requestedLevel: ModelThinkingLevel): string | undefined {
+	if (typeof model.baseUrl !== "string" || model.baseUrl.length === 0) return undefined;
+	try {
+		const endpoint = new URL(model.baseUrl);
+		if ((endpoint.protocol !== "http:" && endpoint.protocol !== "https:") || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return undefined;
+		return JSON.stringify([model.provider, model.api, endpoint.href, model.id, requestedLevel]);
+	} catch {
+		return undefined;
+	}
+}
+
+function notifyThinkingRecovery(ctx: ExtensionContext, rejected: ModelThinkingLevel, replacement: ModelThinkingLevel, lowest: boolean): void {
+	if (!ctx.ui?.notify) return;
+	const suffix = lowest ? ", its lowest supported level." : ".";
+	ctx.ui.notify(
+		`Current summary model does not support thinking ${displayThinkingLevel(rejected)}. Retrying with ${displayThinkingLevel(replacement)}${suffix}`,
+		"warning",
+	);
+}
+
+function displayThinkingLevel(level: ModelThinkingLevel): string {
+	return level === "off" ? "Off" : `${level[0].toUpperCase()}${level.slice(1)}`;
 }
 
 const SYSTEM_PROMPT = `You create compact human-facing Context Hint cards from bounded deterministic evidence.
@@ -1541,24 +1751,6 @@ function decodeHint(
 	return value;
 }
 
-function emptyHint(message: string): ContextHintV1 {
-	return {
-		turnDelta: {
-			accomplished: [],
-			learned: [],
-			ruledOut: [],
-			codeCues: [],
-			verification: [],
-			failures: [redactAndTruncate(message, 500)],
-			decisionsMade: [],
-			questionsForHuman: [],
-		},
-		sessionPatch: {},
-		projectPatch: null,
-		attentionCue: { level: "info", message: "No usable summary returned; retry when needed." },
-	};
-}
-
 function normalizeToolCall(toolCall: ToolCall): ToolCall {
 	const args = structuredClone(toolCall.arguments ?? {});
 	const attentionCue = args.attentionCue;
@@ -1597,7 +1789,11 @@ function isDurableProjectPath(path: string): boolean {
 		/(^|\/)docs\/adr\//.test(path);
 }
 
-function summaryModelThinking(ctx: ExtensionContext, config: ContextHintConfig): string {
+function summaryModelThinking(
+	ctx: ExtensionContext,
+	config: ContextHintConfig,
+	acceptedThinkingLevels?: ReadonlyMap<string, ModelThinkingLevel>,
+): string {
 	const model = resolveModel(ctx, config);
 	if (!model) {
 		const configured = config.model.mode === "inherit"
@@ -1607,8 +1803,10 @@ function summaryModelThinking(ctx: ExtensionContext, config: ContextHintConfig):
 	}
 	const inherited = config.model.mode === "inherit" ? " (inherit)" : "";
 	const resolved = resolveThinkingLevel(model, config.thinkingLevels?.[modelThinkingKey(model)]);
+	const requestedLevel = resolved.level;
+	const cachedLevel = acceptedThinkingLevels?.get(thinkingCacheKey(model, requestedLevel) ?? "");
 	const thinking = supportsThinking(model)
-		? `thinking ${resolved.level}${resolved.fallbackFrom ? ` (saved ${resolved.fallbackFrom} unsupported)` : ""}`
+		? `thinking ${cachedLevel ?? requestedLevel}${cachedLevel && cachedLevel !== requestedLevel ? ` (requested ${requestedLevel}; effective for this session)` : resolved.fallbackFrom ? ` (saved ${resolved.fallbackFrom} unsupported)` : ""}`
 		: "thinking off (not supported)";
 	return `summary model ${modelThinkingKey(model)}${inherited}; ${thinking}`;
 }
@@ -1618,9 +1816,10 @@ function showStatus(
 	config: ContextHintConfig,
 	settings: ContextHintSettings,
 	project: ProjectIdentity,
+	acceptedThinkingLevels?: ReadonlyMap<string, ModelThinkingLevel>,
 ): void {
 	const message = [
-		`Context Hint ${config.enabled ? "enabled" : "disabled"}; ${summaryModelThinking(ctx, config)}; expanded ${settings.expanded}; motion ${settings.motion}; state ${project.paths.dir}`,
+		`Context Hint ${config.enabled ? "enabled" : "disabled"}; ${summaryModelThinking(ctx, config, acceptedThinkingLevels)}; expanded ${settings.expanded}; motion ${settings.motion}; state ${project.paths.dir}`,
 		"Shortcut: Alt+O — expand/collapse cards",
 		...(!config.enabled ? ["Context Hint generation is disabled; existing cards can still be expanded or collapsed."] : []),
 	].join("\n");
