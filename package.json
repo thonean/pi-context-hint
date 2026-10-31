@@ -1,6 +1,6 @@
 {
   "name": "pi-context-hint",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Persistent Project, Session, and Turn context cards for the Pi coding agent.",
   "keywords": [
     "pi-package",
@@ -28,7 +28,7 @@
     "assets/context-hint-still.png"
   ],
   "pi": {
-    "image": "https://cdn.jsdelivr.net/npm/pi-context-hint@0.1.2/assets/context-hint-still.png",
+    "image": "https://cdn.jsdelivr.net/npm/pi-context-hint@0.2.0/assets/context-hint-still.png",
     "extensions": [
       "extensions/context-hint.ts"
     ]
